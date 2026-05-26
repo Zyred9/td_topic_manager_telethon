@@ -1,0 +1,23 @@
+# 环境与密钥
+.env
+
+# 运行期数据(会话/上传/头像)
+sessions/
+data/
+
+# 协议号包 / 任何压缩包(含真实 session + 2FA,绝不入库)
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# 计划/状态(本地)
+.omc/

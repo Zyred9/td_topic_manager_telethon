@@ -23,11 +23,17 @@
 
 ## 运行
 
+> 后端统一用 **conda 虚拟环境**管理,避免污染系统 Python、隔离依赖。
+
 ```bash
-# 1. 安装依赖
+# 1. 创建并激活 conda 虚拟环境(Python 3.10~3.13;本项目验证于 3.13)
+conda create -n td_topic python=3.13 -y
+conda activate td_topic
+
+# 2. 安装依赖(在已激活的虚拟环境内)
 pip install -r requirements.txt
 
-# 2. 配置(复制并按需修改)
+# 3. 配置(复制并按需修改)
 cp .env.example .env
 #   - DB_HOST/PORT/USER/PASSWORD/NAME:MySQL 连接(库不存在会自动建)
 #   - TG_API_ID/HASH:手机号新登录用的全局凭证(协议号用各自 .json)
@@ -35,12 +41,48 @@ cp .env.example .env
 #   - JWT_SECRET:改成随机串
 #   - INIT_ADMIN_USER/PASSWORD:首次启动自动创建超管(首登请改密)
 
-# 3. 启动(自动建库建表 + 建默认超管 + 全起已登录小号)
+# 4. 启动(自动建库建表 + 建默认超管 + 全起已登录小号)
+#    确保已 conda activate td_topic
 python main.py
 ```
 
+> 日常每次启动前先 `conda activate td_topic` 再 `python main.py`。
+> 后续依赖更新:`conda activate td_topic && pip install -r requirements.txt`。
+
 服务默认监听 `0.0.0.0:8813`,根路径 `/collect`(匹配前端 vite 代理 `/api → localhost:8813/collect`)。
 接口文档:`http://localhost:8813/collect/docs`。
+
+### Linux 后台常驻(conda + systemd)
+
+服务器上让后端开机自启 + 崩溃重启,systemd 直接指向 conda 环境里的 python(无需先 activate):
+
+```ini
+# /etc/systemd/system/td-backend.service
+[Unit]
+Description=TD Topic Manager (Python/Telethon) Backend
+After=network.target mysqld.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/td
+# 指向 conda 环境的 python 绝对路径(用 `conda env list` 查路径)
+ExecStart=/root/miniconda3/envs/td_topic/bin/python /opt/td/main.py
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/td/backend.log
+StandardError=append:/opt/td/backend.log
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now td-backend
+sudo systemctl status td-backend       # 查状态
+tail -f /opt/td/backend.log            # 实时日志
+```
 
 ## 前端联调
 

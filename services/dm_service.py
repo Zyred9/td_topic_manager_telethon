@@ -145,6 +145,7 @@ async def list_accounts_with_dm() -> list:
         result.append({
             "phone": r["phone"],
             "tgName": tg_name or None,
+            "tgUsername": acc.tg_username if acc else None,
             "tgUserId": acc.tg_user_id if acc else None,
             "peerCount": int(r["peer_count"]),
             "msgTotal": int(r["msg_total"]),

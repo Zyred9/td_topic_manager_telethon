@@ -82,6 +82,9 @@ class TopicCreateReq(BaseModel):
     topicName: str
     topicPrompt: str
     phones: List[str]
+    # 群入口模式:new_forum=新建Forum群+建首个子话题;
+    # existing_forum=在已有Forum群下新建子话题;existing_chat=接入已有普通群(不带子话题)
+    chatMode: Optional[str] = None
     chatId: Optional[int] = None
     messageThreadId: Optional[int] = None
     speakMinSec: Optional[int] = None

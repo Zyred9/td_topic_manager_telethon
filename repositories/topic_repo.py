@@ -96,3 +96,19 @@ def stop_all_on_startup() -> None:
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE t_ai_topic SET status=0 WHERE status=1")
+
+
+def list_forum_chats() -> List[dict]:
+    """返回平台已有话题中用过的 Forum 群(message_thread_id>0),按 chat_id 去重,带群名。
+    群名取该群任一 watch 记录的 chat_title。"""
+    sql = (
+        "SELECT t.chat_id AS chat_id, MAX(w.chat_title) AS chat_title "
+        "FROM t_ai_topic t "
+        "LEFT JOIN t_account_watch w ON w.chat_id = t.chat_id "
+        "WHERE t.message_thread_id > 0 "
+        "GROUP BY t.chat_id"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            return cur.fetchall()

@@ -138,8 +138,8 @@ WorkingDirectory=/home/bot/td_topic_manager_telethon
 ExecStart=/root/miniconda3/envs/td_topic/bin/python /home/bot/td_topic_manager_telethon/main.py
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/home/bot/td_topic_manager_telethon/backend.log
-StandardError=append:/home/bot/td_topic_manager_telethon/backend.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -149,7 +149,7 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now td-backend
 sudo systemctl status td-backend          # 查状态
-tail -f /home/bot/td_topic_manager_telethon/backend.log               # 实时日志
+sudo journalctl -u td-backend -f               # 实时日志
 ```
 
 > 注意:**服务重启后所有定时任务/AI 话题自动置停**(需求设计),需运营登录后台手动重启任务。
@@ -176,7 +176,7 @@ git pull
 conda activate td_topic && pip install -r requirements.txt
 # 重启服务生效
 sudo systemctl restart td-backend
-tail -f /home/bot/td_topic_manager_telethon/backend.log
+sudo journalctl -u td-backend -f
 ```
 
 > **.env 冲突处理**:服务器上若手动改过 `.env`,而远端 `.env` 也变了,`git pull` 会冲突。
@@ -341,7 +341,7 @@ sudo certbot renew --dry-run                 # 验证自动续期
 /home/bot/td_topic_manager_telethon/sessions/               小号 .session(运行期生成,备份重点)
 /home/bot/td_topic_manager_telethon/data/avatar/            头像
 /home/bot/td_topic_manager_telethon/data/upload/            zip 上传临时
-/home/bot/td_topic_manager_telethon/backend.log             后端日志
+(后端日志走 journald,用 journalctl -u td-backend 查,不写文件)
 /var/www/td_web/                前端静态文件
 /etc/nginx/conf.d/td_web.conf   Nginx 配置
 /etc/systemd/system/td-backend.service   后端守护

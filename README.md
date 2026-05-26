@@ -70,8 +70,8 @@ WorkingDirectory=/home/bot/td_topic_manager_telethon
 ExecStart=/root/miniconda3/envs/td_topic/bin/python /home/bot/td_topic_manager_telethon/main.py
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/home/bot/td_topic_manager_telethon/backend.log
-StandardError=append:/home/bot/td_topic_manager_telethon/backend.log
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -81,7 +81,7 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now td-backend
 sudo systemctl status td-backend       # 查状态
-tail -f /home/bot/td_topic_manager_telethon/backend.log            # 实时日志
+sudo journalctl -u td-backend -f       # 实时日志(走 journald,不写文件)
 ```
 
 ## 前端联调

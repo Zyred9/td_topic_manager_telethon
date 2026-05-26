@@ -44,6 +44,10 @@ async def lifespan(app: FastAPI):
     logger.info("检查默认超级管理员...")
     await auth_service.ensure_init_admin()
 
+    logger.info("初始化人设配置标签库(性格/兴趣/emoji)...")
+    from services import persona_service
+    await persona_service.init_default_configs()
+
     # 重启不自动恢复任务:定时任务与话题全置停
     from services import schedule_service, keyword_service, topic_scheduler
     await schedule_service.stop_all_on_startup()

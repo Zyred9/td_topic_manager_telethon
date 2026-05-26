@@ -105,3 +105,24 @@ CREATE TABLE IF NOT EXISTS t_persona_preset (
   preset_json TEXT        NOT NULL COMMENT '人设 JSON',
   create_time DATETIME    NOT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='自定义人设预置模板(内置5个写代码常量)';
+
+CREATE TABLE IF NOT EXISTS t_persona_tone (
+  id          BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  label       VARCHAR(32) NOT NULL COMMENT '性格标签,如 幽默',
+  create_time DATETIME    NOT NULL,
+  UNIQUE KEY uk_label (label)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='性格标签库';
+
+CREATE TABLE IF NOT EXISTS t_persona_interest (
+  id          BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  label       VARCHAR(32) NOT NULL COMMENT '兴趣标签,如 游戏',
+  create_time DATETIME    NOT NULL,
+  UNIQUE KEY uk_label (label)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='兴趣标签库';
+
+CREATE TABLE IF NOT EXISTS t_persona_emoji (
+  id          BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  emoji       VARCHAR(16) NOT NULL COMMENT 'Unicode emoji 字符,如 😀',
+  create_time DATETIME    NOT NULL,
+  UNIQUE KEY uk_emoji (emoji)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI 回复随机表情库';

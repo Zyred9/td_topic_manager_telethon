@@ -131,3 +131,8 @@ class PersonaPresetReq(BaseModel):
 
 class PersonaPreviewReq(BaseModel):
     topicPrompt: Optional[str] = None
+
+
+class PersonaConfigReq(BaseModel):
+    """性格/兴趣/emoji 标签库增改,value 为标签文本或 emoji 字符。"""
+    value: str

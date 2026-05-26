@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import time
 from typing import List, Optional
 
 import httpx
@@ -21,6 +22,42 @@ from config.settings import get_settings
 from helpers.han_counter import count_han, truncate_by_han
 
 logger = logging.getLogger(__name__)
+
+# ---------- emoji 库(带内存缓存,避免每条回复查库) ----------
+_emoji_cache: tuple[float, List[str]] = (0.0, [])
+_EMOJI_CACHE_TTL = 60.0
+# emojiLevel → 回复后拼 emoji 的概率
+_EMOJI_PROB = {"never": 0.0, "sometimes": 0.3, "often": 0.7}
+
+
+async def _load_emojis() -> List[str]:
+    global _emoji_cache
+    now = time.monotonic()
+    if _emoji_cache[1] and _emoji_cache[0] > now:
+        return _emoji_cache[1]
+    from infra.db import run_db
+    from repositories import persona_config_repo
+    try:
+        values = await run_db(persona_config_repo.list_values, "emoji")
+    except Exception as exc:
+        logger.warning("加载 emoji 库失败: %s", exc)
+        values = []
+    _emoji_cache = (now + _EMOJI_CACHE_TTL, values)
+    return values
+
+
+async def _append_emoji(text: str, persona: dict) -> str:
+    """按人设 emojiLevel 概率从 emoji 库随机抽一个拼到回复末尾。"""
+    if not text:
+        return text
+    level = persona.get("emojiLevel") or "never"
+    prob = _EMOJI_PROB.get(level, 0.0)
+    if prob <= 0 or random.random() >= prob:
+        return text
+    emojis = await _load_emojis()
+    if not emojis:
+        return text
+    return text + random.choice(emojis)
 
 
 # ---------- 人设渲染 ----------
@@ -157,6 +194,8 @@ async def generate_reply(
             text = truncate_by_han(text, MAX_HAN_CHARS)
         if not _too_similar(text, context_msgs):
             break
+    # 按 emojiLevel 概率从 emoji 库随机拼一个到末尾(汉字不计,不受 50 字上限影响)
+    text = await _append_emoji(text, persona)
     return text
 
 

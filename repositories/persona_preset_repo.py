@@ -26,6 +26,16 @@ def insert(preset_name: str, preset: dict) -> int:
             return int(cur.lastrowid)
 
 
+def update(preset_id: int, preset_name: str, preset: dict) -> int:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE t_persona_preset SET preset_name=%s, preset_json=%s WHERE id=%s",
+                (preset_name, json.dumps(preset, ensure_ascii=False), preset_id),
+            )
+            return int(cur.rowcount)
+
+
 def delete(preset_id: int) -> int:
     with get_connection() as conn:
         with conn.cursor() as cur:

@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 # ---------- 加群 ----------
 async def run_join(phones: List[str], group_link: str, batch_id: str) -> None:
     risk = get_settings().risk
+    # 入口日志:记录前端传来的原始链接(repr 保留引号/空白,便于发现误传群ID/带空格等)
+    logger.info("[加群] 批次=%s 收到原始链接=%r 号数=%d", batch_id, group_link, len(phones))
     for phone in phones:
         await asyncio.sleep(random.uniform(risk.join_jitter_min_sec, risk.join_jitter_max_sec))
         client = client_manager.get_ready_client(phone)
@@ -39,19 +41,26 @@ async def run_join(phones: List[str], group_link: str, batch_id: str) -> None:
             batch_store.set_item(batch_id, phone, ITEM_SUCCESS, chat_id=chat_id)
             logger.info("[加群] %s 成功 chat=%s(%s)", phone, chat_id, chat_title)
         except Exception as exc:
+            # 记录原始异常类型+完整堆栈,排查时直接看这条(不是翻译后的中文)
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
-            logger.warning("[加群] %s 失败: %s", phone, exc)
+            logger.warning("[加群] %s 失败 原始链接=%r 异常类型=%s 异常=%s",
+                           phone, group_link, type(exc).__name__, exc)
+            logger.debug("[加群] %s 失败堆栈", phone, exc_info=True)
     batch_store.finish(batch_id)
 
 
 async def _join_one(client, group_link: str):
     """返回 (chat_id, chat_title)。"""
     parsed = link_parser.parse(group_link)
+    logger.info("[加群] 链接解析 原始=%r -> kind=%s value=%r", group_link, parsed.kind, parsed.value)
     if parsed.kind == "public":
+        # get_entity 的目标是用户名(字符串),若这里看到的是 -100 数字,说明输入的是群ID而非链接
+        logger.info("[加群] 公开群,get_entity 目标=%r", parsed.value)
         entity = await client.get_entity(parsed.value)
         await client(functions.channels.JoinChannelRequest(entity))
         return _peer_id(entity), getattr(entity, "title", None)
     # invite
+    logger.info("[加群] 邀请链接,import invite hash=%r", parsed.value)
     updates = await client(functions.messages.ImportChatInviteRequest(parsed.value))
     chats = getattr(updates, "chats", None)
     if chats:

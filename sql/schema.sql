@@ -126,3 +126,33 @@ CREATE TABLE IF NOT EXISTS t_persona_emoji (
   create_time DATETIME    NOT NULL,
   UNIQUE KEY uk_emoji (emoji)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='AI 回复随机表情库';
+
+CREATE TABLE IF NOT EXISTS t_dm_peer (
+  id            BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  phone         VARCHAR(32) NOT NULL COMMENT '所属小号',
+  peer_user_id  BIGINT      NOT NULL COMMENT '私聊对方的 TG 用户 ID',
+  username      VARCHAR(64) COMMENT '对方用户名',
+  first_name    VARCHAR(64) COMMENT '对方名',
+  last_name     VARCHAR(64) COMMENT '对方姓',
+  last_msg_time DATETIME    COMMENT '最近一条消息时间',
+  msg_count     INT         NOT NULL DEFAULT 0 COMMENT '消息条数',
+  create_time   DATETIME    NOT NULL,
+  UNIQUE KEY uk_phone_peer (phone, peer_user_id),
+  INDEX idx_phone (phone)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='私聊对象(小号收到私聊的对方)';
+
+CREATE TABLE IF NOT EXISTS t_dm_message (
+  id           BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  phone        VARCHAR(32) NOT NULL COMMENT '所属小号',
+  peer_user_id BIGINT      NOT NULL COMMENT '私聊对方 TG 用户 ID',
+  tg_msg_id    BIGINT      COMMENT 'Telegram 消息 ID',
+  msg_type     VARCHAR(16) NOT NULL COMMENT 'text/photo/video/file/sticker/voice/other',
+  content      TEXT        COMMENT '文本内容(媒体消息为 caption)',
+  media_path   VARCHAR(255) COMMENT '媒体本地相对路径(下载成功才有)',
+  media_size   BIGINT      COMMENT '媒体字节数',
+  media_note   VARCHAR(128) COMMENT '未下载时的说明(如 超过大小上限)',
+  msg_time     DATETIME    NOT NULL COMMENT '消息时间',
+  create_time  DATETIME    NOT NULL,
+  INDEX idx_phone_peer (phone, peer_user_id),
+  INDEX idx_msg_time (msg_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='私聊消息(只记收到的一对一)';

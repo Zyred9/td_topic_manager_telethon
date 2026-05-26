@@ -56,6 +56,8 @@ async def lifespan(app: FastAPI):
     # 注册消息 listener(必须在全起之前,确保全起的号能被监听)
     keyword_service.register()
     topic_scheduler.register()
+    from services import dm_service
+    dm_service.register()
 
     logger.info("启动 ClientManager 全起已登录小号...")
     from core.client_manager import client_manager
@@ -103,8 +105,9 @@ def create_app() -> FastAPI:
 
     _register_routers(app)
 
-    # 静态资源:头像。前端访问 {root_path}/static/avatar/xxx
+    # 静态资源:头像 + 私聊媒体。前端访问 {root_path}/static/avatar|media/xxx
     app.mount("/static/avatar", StaticFiles(directory=str(settings.avatar_dir)), name="avatar")
+    app.mount("/static/media", StaticFiles(directory=str(settings.media_dir)), name="media")
 
     return app
 
@@ -122,6 +125,9 @@ def _register_routers(app: FastAPI) -> None:
     app.include_router(keyword_api.router)
     app.include_router(topic_api.router)
     app.include_router(persona_api.router)
+
+    from api import dm_api
+    app.include_router(dm_api.router)
 
 
 app = create_app()

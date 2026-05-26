@@ -123,9 +123,13 @@ class Settings:
     def avatar_dir(self) -> Path:
         return self.base_dir / "data" / "avatar"
 
+    @property
+    def media_dir(self) -> Path:
+        return self.base_dir / "data" / "media"
+
     def ensure_dirs(self) -> None:
         """确保运行期目录存在。"""
-        for path in (self.sessions_dir, self.upload_dir, self.avatar_dir):
+        for path in (self.sessions_dir, self.upload_dir, self.avatar_dir, self.media_dir):
             path.mkdir(parents=True, exist_ok=True)
 
 

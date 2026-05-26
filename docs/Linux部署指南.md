@@ -43,16 +43,16 @@ sudo dnf install -y git wget tar bzip2 gcc
 后端代码托管在 GitHub **私有仓库**,本地改完 push,服务器直接 `git pull` 更新,不用 scp。
 
 ```bash
-# 服务器:克隆到 /home/bot/td_topic_manager_telethon(私有仓库会提示输入 GitHub 账号 + Personal Access Token)
+# 服务器:克隆到 /home/bots/td_topic_manager_telethon(私有仓库会提示输入 GitHub 账号 + Personal Access Token)
 sudo dnf install -y git
-git clone https://github.com/Zyred9/td_topic_manager_telethon.git /home/bot/td_topic_manager_telethon
-cd /home/bot/td_topic_manager_telethon
+git clone https://github.com/Zyred9/td_topic_manager_telethon.git /home/bots/td_topic_manager_telethon
+cd /home/bots/td_topic_manager_telethon
 ```
 
 > 私有仓库认证:GitHub 已不支持密码,需用 **Personal Access Token**(GitHub → Settings → Developer settings → Personal access tokens,勾 `repo` 权限)。
 > 免每次输入可配缓存:`git config --global credential.helper store`(首次输入后保存,注意 token 明文存 `~/.git-credentials`)。
 >
-> **注意**:`.env` 已随仓库提交(私有仓库),clone 下来就自带数据库密码/key 等配置,**无需再 cp .env.example**。若服务器 MySQL 密码与 `.env` 不同,直接改 `/home/bot/td_topic_manager_telethon/.env` 即可(改本地文件不影响 git,除非你 commit)。
+> **注意**:`.env` 已随仓库提交(私有仓库),clone 下来就自带数据库密码/key 等配置,**无需再 cp .env.example**。若服务器 MySQL 密码与 `.env` 不同,直接改 `/home/bots/td_topic_manager_telethon/.env` 即可(改本地文件不影响 git,除非你 commit)。
 > `sessions/`、`data/` 在 `.gitignore` 里,不会被拉取/覆盖(小号登录态安全保留)。
 
 ### 1.3 创建 conda 虚拟环境 + 装依赖
@@ -65,7 +65,7 @@ cd /home/bot/td_topic_manager_telethon
 > ```
 
 ```bash
-cd /home/bot/td_topic_manager_telethon
+cd /home/bots/td_topic_manager_telethon
 
 # 新版 conda 首次用官方源会报 "Terms of Service have not been accepted",
 # 先接受两个官方 channel 的 ToS(一次即可,以后不再提示):
@@ -78,7 +78,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 
 # 记下环境里 python 的绝对路径,systemd 要用(见 1.6):
-which python        # 形如 /root/miniconda3/envs/td_topic/bin/python
+echo $CONDA_PREFIX/bin/python   # 形如 /root/miniconda3/envs/td_topic/bin/python
 ```
 
 ### 1.4 确认 / 调整 .env
@@ -86,7 +86,7 @@ which python        # 形如 /root/miniconda3/envs/td_topic/bin/python
 `.env` 已随仓库 clone 下来(私有仓库已含配置),通常**无需新建**。只在服务器实际值不同时调整:
 
 ```bash
-cd /home/bot/td_topic_manager_telethon
+cd /home/bots/td_topic_manager_telethon
 vi .env
 ```
 
@@ -110,7 +110,7 @@ LLM_API_KEY=sk-...                     # deepseek key(已有值,确认有效)
 ### 1.5 先手动跑一次验证
 
 ```bash
-cd /home/bot/td_topic_manager_telethon
+cd /home/bots/td_topic_manager_telethon
 conda activate td_topic
 python main.py
 # 看到 "服务启动完成,根路径 /collect,端口 8813" 即 OK
@@ -133,10 +133,11 @@ After=network.target mysqld.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/bot/td_topic_manager_telethon
-# 用 conda run 激活 td_topic 环境再启动(环境变量齐全,比直接调 envs/.../python 规范);
-# --no-capture-output 让日志实时进 journald;/root/miniconda3 换成你的 conda 安装路径(which conda 查)
-ExecStart=/root/miniconda3/bin/conda run --no-capture-output -n td_topic python /home/bot/td_topic_manager_telethon/main.py
+WorkingDirectory=/home/bots/td_topic_manager_telethon
+# 直接指 conda 环境里的 python 绝对路径(1.3 节激活后 `echo $CONDA_PREFIX/bin/python` 查到的值)。
+# 不用 conda run/activate:conda 在 shell 里是函数,systemd 无 shell 函数环境调不动;
+# 直接指环境 python 即用该环境的 site-packages,纯 pip 包完全够用。
+ExecStart=/root/miniconda3/envs/td_topic/bin/python /home/bots/td_topic_manager_telethon/main.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal
@@ -171,7 +172,7 @@ git push
 服务器拉取并重启:
 
 ```bash
-cd /home/bot/td_topic_manager_telethon
+cd /home/bots/td_topic_manager_telethon
 git pull
 # 若依赖(requirements.txt)有变更:
 conda activate td_topic && pip install -r requirements.txt
@@ -336,19 +337,19 @@ sudo certbot renew --dry-run                 # 验证自动续期
 ## 五、目录速记
 
 ```
-/home/bot/td_topic_manager_telethon/                        后端源码
+/home/bots/td_topic_manager_telethon/                        后端源码
 /root/miniconda3/envs/td_topic/  conda 虚拟环境(依赖)
-/home/bot/td_topic_manager_telethon/.env                    配置(密钥,勿外泄)
-/home/bot/td_topic_manager_telethon/sessions/               小号 .session(运行期生成,备份重点)
-/home/bot/td_topic_manager_telethon/data/avatar/            头像
-/home/bot/td_topic_manager_telethon/data/upload/            zip 上传临时
+/home/bots/td_topic_manager_telethon/.env                    配置(密钥,勿外泄)
+/home/bots/td_topic_manager_telethon/sessions/               小号 .session(运行期生成,备份重点)
+/home/bots/td_topic_manager_telethon/data/avatar/            头像
+/home/bots/td_topic_manager_telethon/data/upload/            zip 上传临时
 (后端日志走 journald,用 journalctl -u td-backend 查,不写文件)
 /var/www/td_web/                前端静态文件
 /etc/nginx/conf.d/td_web.conf   Nginx 配置
 /etc/systemd/system/td-backend.service   后端守护
 ```
 
-> **备份重点**:`/home/bot/td_topic_manager_telethon/sessions/`(小号登录态)和 MySQL 数据库。丢了 sessions 所有小号要重新登录。
+> **备份重点**:`/home/bots/td_topic_manager_telethon/sessions/`(小号登录态)和 MySQL 数据库。丢了 sessions 所有小号要重新登录。
 
 ---
 

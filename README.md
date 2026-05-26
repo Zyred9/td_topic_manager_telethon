@@ -54,7 +54,9 @@ python main.py
 
 ### Linux 后台常驻(conda + systemd)
 
-服务器上让后端开机自启 + 崩溃重启,systemd 直接指向 conda 环境里的 python(无需先 activate):
+服务器上让后端开机自启 + 崩溃重启。systemd 直接指向 **conda 环境里的 python 绝对路径**
+(就是该环境的 python,site-packages 即 td_topic 环境的,纯 pip 包完全够用;
+不走 `conda run`/`conda activate`——因为 conda 在 shell 里是函数,systemd 无 shell 函数环境调不动):
 
 ```ini
 # /etc/systemd/system/td-backend.service
@@ -65,10 +67,9 @@ After=network.target mysqld.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/home/bot/td_topic_manager_telethon
-# 用 conda run 激活 td_topic 环境再启动(环境变量齐全,比直接调 envs/.../python 规范)
-# --no-capture-output 让日志实时进 journald;/root/miniconda3 换成你的 conda 安装路径
-ExecStart=/root/miniconda3/bin/conda run --no-capture-output -n td_topic python /home/bot/td_topic_manager_telethon/main.py
+WorkingDirectory=/home/bots/td_topic_manager_telethon
+# 环境 python 绝对路径:激活 td_topic 后 `echo $CONDA_PREFIX/bin/python` 查到的值
+ExecStart=/root/miniconda3/envs/td_topic/bin/python /home/bots/td_topic_manager_telethon/main.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

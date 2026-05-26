@@ -134,8 +134,9 @@ After=network.target mysqld.service
 Type=simple
 User=root
 WorkingDirectory=/home/bot/td_topic_manager_telethon
-# 指向 conda 环境的 python 绝对路径(1.3 节 `which python` 查到的),会自动读取 /home/bot/td_topic_manager_telethon/.env
-ExecStart=/root/miniconda3/envs/td_topic/bin/python /home/bot/td_topic_manager_telethon/main.py
+# 用 conda run 激活 td_topic 环境再启动(环境变量齐全,比直接调 envs/.../python 规范);
+# --no-capture-output 让日志实时进 journald;/root/miniconda3 换成你的 conda 安装路径(which conda 查)
+ExecStart=/root/miniconda3/bin/conda run --no-capture-output -n td_topic python /home/bot/td_topic_manager_telethon/main.py
 Restart=on-failure
 RestartSec=10
 StandardOutput=journal

@@ -27,6 +27,29 @@ async def list_accounts(
     return result(data)
 
 
+@router.get("/{phone}/groups")
+async def list_groups(
+    phone: str, page: int = 1, size: int = 10, _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """该小号已加入的群(分页)。"""
+    return result(await account_service.list_groups(phone, page, size))
+
+
+@router.post("/{phone}/leave-group")
+async def leave_group(
+    phone: str, body: dict, _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """该小号退出指定群。body: {chatId}"""
+    chat_id = body.get("chatId")
+    if chat_id is None:
+        raise BizError("缺少 chatId")
+    try:
+        await account_service.leave_group(phone, int(chat_id))
+    except AccountError as exc:
+        raise BizError(exc.message, code=exc.code) from exc
+    return result()
+
+
 @router.post("/login")
 async def phone_login(req: PhoneLoginReq, _: CurrentUser = Depends(get_current_user)) -> dict:
     try:

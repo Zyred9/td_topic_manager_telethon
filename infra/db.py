@@ -130,3 +130,29 @@ def init_schema() -> None:
             for stmt in statements:
                 cursor.execute(stmt)
     logger.info("数据库表初始化完成,共执行 %d 条建表语句", len(statements))
+    _run_migrations()
+
+
+def _column_exists(cursor, table: str, column: str) -> bool:
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = %s AND column_name = %s",
+        (table, column),
+    )
+    row = cursor.fetchone()
+    return bool(row and row["cnt"])
+
+
+def _run_migrations() -> None:
+    """对已存在的老库做幂等补列(新库 schema.sql 已含,跳过)。"""
+    migrations = [
+        ("t_account_watch", "chat_title",
+         "ALTER TABLE t_account_watch ADD COLUMN chat_title VARCHAR(255) "
+         "COMMENT '群名(加群时回填,展示用)' AFTER chat_id"),
+    ]
+    with get_connection() as connection:
+        with connection.cursor() as cursor:
+            for table, column, ddl in migrations:
+                if not _column_exists(cursor, table, column):
+                    cursor.execute(ddl)
+                    logger.info("迁移:%s 新增列 %s", table, column)

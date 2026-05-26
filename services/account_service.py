@@ -23,7 +23,7 @@ from core.client_manager import client_manager
 from core.throttle import throttle
 from infra import telethon_factory
 from infra.db import get_connection, run_db
-from repositories import account_repo
+from repositories import account_repo, account_watch_repo
 
 logger = logging.getLogger(__name__)
 
@@ -55,6 +55,31 @@ def _to_vo(acc) -> dict:
 async def list_accounts(page_no: int, size: int, keyword: Optional[str], status: Optional[int]) -> dict:
     records, total = await run_db(account_repo.page, page_no, size, keyword, status)
     return {"page": page_no, "size": size, "total": total, "records": [_to_vo(a) for a in records]}
+
+
+async def list_groups(phone: str, page_no: int, size: int) -> dict:
+    """分页查询某小号已加入的群(来自 t_account_watch 平台记录)。"""
+    phone = _normalize(phone)
+    rows, total = await run_db(account_watch_repo.page_by_phone, phone, page_no, size)
+    records = [
+        {
+            "chatId": r["chat_id"],
+            "chatTitle": r.get("chat_title") or str(r["chat_id"]),  # 无群名兜底显示 ID
+            "joinedAt": r["joined_at"].strftime("%Y-%m-%d %H:%M:%S") if r.get("joined_at") else None,
+        }
+        for r in rows
+    ]
+    return {"page": page_no, "size": size, "total": total, "records": records}
+
+
+async def leave_group(phone: str, chat_id: int) -> None:
+    """某小号退出指定群(同步)。"""
+    from services import group_op_service
+    phone = _normalize(phone)
+    try:
+        await group_op_service.leave_one(phone, chat_id)
+    except Exception as exc:
+        raise AccountError(str(exc)) from exc
 
 
 # ---------- 手机号登录 ----------

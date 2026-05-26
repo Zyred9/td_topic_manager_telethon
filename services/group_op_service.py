@@ -34,27 +34,28 @@ async def run_join(phones: List[str], group_link: str, batch_id: str) -> None:
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason="小号未就绪")
             continue
         try:
-            chat_id = await _join_one(client, group_link)
-            await run_db(account_watch_repo.add, phone, chat_id)
+            chat_id, chat_title = await _join_one(client, group_link)
+            await run_db(account_watch_repo.add, phone, chat_id, chat_title)
             batch_store.set_item(batch_id, phone, ITEM_SUCCESS, chat_id=chat_id)
-            logger.info("[加群] %s 成功 chat=%s", phone, chat_id)
+            logger.info("[加群] %s 成功 chat=%s(%s)", phone, chat_id, chat_title)
         except Exception as exc:
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
             logger.warning("[加群] %s 失败: %s", phone, exc)
     batch_store.finish(batch_id)
 
 
-async def _join_one(client, group_link: str) -> int:
+async def _join_one(client, group_link: str):
+    """返回 (chat_id, chat_title)。"""
     parsed = link_parser.parse(group_link)
     if parsed.kind == "public":
         entity = await client.get_entity(parsed.value)
         await client(functions.channels.JoinChannelRequest(entity))
-        return _peer_id(entity)
+        return _peer_id(entity), getattr(entity, "title", None)
     # invite
     updates = await client(functions.messages.ImportChatInviteRequest(parsed.value))
     chats = getattr(updates, "chats", None)
     if chats:
-        return _peer_id(chats[0])
+        return _peer_id(chats[0]), getattr(chats[0], "title", None)
     raise RuntimeError("加入邀请群后未返回群信息")
 
 
@@ -74,6 +75,23 @@ async def run_leave(phones: List[str], chat_id: int, batch_id: str) -> None:
         except Exception as exc:
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
     batch_store.finish(batch_id)
+
+
+# ---------- 单号单群退群(同步返回) ----------
+async def leave_one(phone: str, chat_id: int) -> None:
+    """单个小号退出单个群,同步返回。失败抛异常(中文)。"""
+    client = client_manager.get_ready_client(phone)
+    if client is None:
+        raise RuntimeError("小号未就绪")
+    try:
+        entity = await client.get_entity(chat_id)
+        await client(functions.channels.LeaveChannelRequest(entity))
+    except Exception as exc:
+        # 即使 TG 端退群失败(如群已不存在),也清理本地路由记录
+        await run_db(account_watch_repo.remove, phone, chat_id)
+        raise RuntimeError(td_error.translate(exc)) from exc
+    await run_db(account_watch_repo.remove, phone, chat_id)
+    logger.info("[退群] %s 退出 chat=%s", phone, chat_id)
 
 
 # ---------- 在群校验(同步返回) ----------

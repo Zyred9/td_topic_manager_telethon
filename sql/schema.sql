@@ -78,10 +78,11 @@ CREATE TABLE IF NOT EXISTS t_ai_topic_member (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='话题成员';
 
 CREATE TABLE IF NOT EXISTS t_account_watch (
-  id        BIGINT      PRIMARY KEY AUTO_INCREMENT,
-  phone     VARCHAR(32) NOT NULL,
-  chat_id   BIGINT      NOT NULL,
-  joined_at DATETIME    NOT NULL COMMENT '小号加入该群的时间',
+  id         BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  phone      VARCHAR(32) NOT NULL,
+  chat_id    BIGINT      NOT NULL,
+  chat_title VARCHAR(255) COMMENT '群名(加群时回填,展示用)',
+  joined_at  DATETIME    NOT NULL COMMENT '小号加入该群的时间',
   UNIQUE KEY uk (phone, chat_id),
   INDEX idx_chat (chat_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='小号在群路由表';

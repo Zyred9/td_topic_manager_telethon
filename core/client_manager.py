@@ -47,14 +47,28 @@ class ClientManager:
         return list(self._clients.keys())
 
     # ---------- 全起 ----------
+    # 单个号启动连接超时(秒),防某个号卡死拖垮整个启动
+    _CONNECT_TIMEOUT = 15.0
+
     async def startup(self) -> None:
-        """服务启动:重置遗留状态,再把已登录(status=3)的号重连验证。"""
+        """服务启动:重置遗留状态,再把"已登录(3)"和"需重新登录(5)"的号都试连。
+
+        协议号 session 是已登录态凭证,connect 即生效不需验证码,所以状态 5 的号
+        若只是上次临时连接失败被误标,本次能连上就自动恢复成状态 3;真正失效/被
+        作废的维持 5,等运营人工重新导入。
+        """
         await run_db(account_repo.reset_all_status_on_startup)
-        accounts = await run_db(account_repo.find_by_status, int(AccountStatus.LOGGED_IN))
-        logger.info("启动全起:发现 %d 个已登录小号待重连", len(accounts))
+        accounts = await run_db(
+            account_repo.find_by_statuses,
+            [int(AccountStatus.LOGGED_IN), int(AccountStatus.NEED_RELOGIN)],
+        )
+        logger.info("启动全起:发现 %d 个小号待试连(含需重新登录的)", len(accounts))
         for acc in accounts:
             try:
-                await self._connect_account(acc)
+                await asyncio.wait_for(self._connect_account(acc), timeout=self._CONNECT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("全起小号超时(%.0fs),跳过 phone=%s", self._CONNECT_TIMEOUT, acc.phone)
+                await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
             except errors.AuthKeyDuplicatedError:
                 # session 在多个 IP 同时使用被 TG 作废,是明确终态(需重新登录),
                 # 不是程序异常,记清晰 WARNING 不刷堆栈,继续起其它号。

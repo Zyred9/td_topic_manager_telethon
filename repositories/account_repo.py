@@ -33,6 +33,18 @@ def find_by_status(status: int) -> List[Account]:
     return [Account.from_row(r) for r in rows]
 
 
+def find_by_statuses(statuses: List[int]) -> List[Account]:
+    """按多个状态查询(启动全起用:已登录 + 需重新登录都试连)。"""
+    if not statuses:
+        return []
+    placeholders = ",".join(["%s"] * len(statuses))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT * FROM t_account WHERE status IN ({placeholders})", tuple(statuses))
+            rows = cur.fetchall()
+    return [Account.from_row(r) for r in rows]
+
+
 def page(
     page_no: int, size: int, keyword: Optional[str], status: Optional[int]
 ) -> Tuple[List[Account], int]:

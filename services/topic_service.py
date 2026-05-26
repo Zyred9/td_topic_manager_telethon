@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from telethon import errors
 from telethon.tl import functions, types
+from telethon.tl.tlobject import TLRequest
 from telethon.utils import get_peer_id
 
 from config.constants import TaskStatus
@@ -20,6 +21,48 @@ from infra.db import run_db
 from repositories import account_watch_repo, topic_member_repo, topic_repo
 
 logger = logging.getLogger(__name__)
+
+
+class _EditCreatorRequest(TLRequest):
+    """移交超级群所有权(channels.editCreator)。
+
+    Telethon 1.43.2 的打包 schema 缺失 channels.EditCreatorRequest,这里按
+    官方 TL 定义手工复刻(constructor id 0x8f38cd1f,返回 Updates),
+    不依赖库里是否存在该类。传入参数需已是 InputChannel / InputUser /
+    InputCheckPasswordSRP(本类不做 resolve)。
+    """
+
+    CONSTRUCTOR_ID = 0x8f38cd1f
+    SUBCLASS_OF_ID = 0x8af52aac
+
+    def __init__(self, channel, user_id, password):
+        self.channel = channel
+        self.user_id = user_id
+        self.password = password
+
+    def to_dict(self):
+        return {
+            "_": "EditCreatorRequest",
+            "channel": self.channel,
+            "user_id": self.user_id,
+            "password": self.password,
+        }
+
+    def _bytes(self):
+        return b"".join((
+            b"\x1f\xcd8\x8f",
+            self.channel._bytes(),
+            self.user_id._bytes(),
+            self.password._bytes(),
+        ))
+
+    @classmethod
+    def from_reader(cls, reader):
+        _channel = reader.tgread_object()
+        _user_id = reader.tgread_object()
+        _password = reader.tgread_object()
+        return cls(channel=_channel, user_id=_user_id, password=_password)
+
 
 _DEFAULTS = {
     "message_thread_id": 0, "speak_min_sec": 30, "speak_max_sec": 180,
@@ -197,12 +240,12 @@ async def transfer_owner(topic_id: int, new_owner_phone: str, password: str) -> 
     if new_client is None:
         raise TopicError("新群主小号未就绪")
     try:
-        entity = await owner_client.get_entity(row["chat_id"])
+        # raw 请求不走 resolve,需自行传 InputChannel / InputUser
+        input_channel = await owner_client.get_input_entity(row["chat_id"])
         new_me = await new_client.get_me()
-        # 用 InputUser(id, access_hash) 构造,避免 owner 端冷缓存解析不到新群主
         new_user = types.InputUser(user_id=new_me.id, access_hash=new_me.access_hash or 0)
-        await owner_client(functions.channels.EditCreatorRequest(
-            channel=entity,
+        await owner_client(_EditCreatorRequest(
+            channel=input_channel,
             user_id=new_user,
             password=await _make_password(owner_client, password),
         ))

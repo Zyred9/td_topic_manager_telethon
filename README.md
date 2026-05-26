@@ -65,13 +65,13 @@ After=network.target mysqld.service
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/td
+WorkingDirectory=/home/bot/td_topic_manager_telethon
 # 指向 conda 环境的 python 绝对路径(用 `conda env list` 查路径)
-ExecStart=/root/miniconda3/envs/td_topic/bin/python /opt/td/main.py
+ExecStart=/root/miniconda3/envs/td_topic/bin/python /home/bot/td_topic_manager_telethon/main.py
 Restart=on-failure
 RestartSec=10
-StandardOutput=append:/opt/td/backend.log
-StandardError=append:/opt/td/backend.log
+StandardOutput=append:/home/bot/td_topic_manager_telethon/backend.log
+StandardError=append:/home/bot/td_topic_manager_telethon/backend.log
 
 [Install]
 WantedBy=multi-user.target
@@ -81,7 +81,7 @@ WantedBy=multi-user.target
 sudo systemctl daemon-reload
 sudo systemctl enable --now td-backend
 sudo systemctl status td-backend       # 查状态
-tail -f /opt/td/backend.log            # 实时日志
+tail -f /home/bot/td_topic_manager_telethon/backend.log            # 实时日志
 ```
 
 ## 前端联调

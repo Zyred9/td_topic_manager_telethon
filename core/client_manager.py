@@ -13,7 +13,7 @@ import asyncio
 import logging
 from typing import Dict, Optional
 
-from telethon import TelegramClient, events
+from telethon import TelegramClient, errors, events
 
 from config.constants import AccountStatus
 from core import update_router
@@ -55,30 +55,47 @@ class ClientManager:
         for acc in accounts:
             try:
                 await self._connect_account(acc)
+            except errors.AuthKeyDuplicatedError:
+                # session 在多个 IP 同时使用被 TG 作废,是明确终态(需重新登录),
+                # 不是程序异常,记清晰 WARNING 不刷堆栈,继续起其它号。
+                logger.warning(
+                    "小号 %s 的 session 已被 Telegram 作废(同一 session 在多个 IP 使用),"
+                    "需重新登录获取新 session", acc.phone,
+                )
+                await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
             except Exception:
                 logger.exception("全起小号失败 phone=%s", acc.phone)
                 await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
 
     async def _connect_account(self, account) -> None:
         client = telethon_factory.build_client_for_account(account)
-        await client.connect()
-        if not await client.is_user_authorized():
-            logger.warning("小号 %s 会话已失效,需重新登录", account.phone)
-            await client.disconnect()
-            await run_db(account_repo.update_status, account.phone, int(AccountStatus.NEED_RELOGIN))
-            return
-        me = await client.get_me()
-        self._register_events(account.phone, client)
-        self._clients[account.phone] = client
-        await run_db(
-            account_repo.mark_logged_in,
-            account.phone,
-            getattr(me, "id", None),
-            getattr(me, "first_name", None),
-            getattr(me, "last_name", None),
-            getattr(me, "username", None),
-        )
-        logger.info("小号 %s 重连成功 tg_user_id=%s", account.phone, getattr(me, "id", None))
+        registered = False
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                logger.warning("小号 %s 会话已失效,需重新登录", account.phone)
+                await run_db(account_repo.update_status, account.phone, int(AccountStatus.NEED_RELOGIN))
+                return
+            me = await client.get_me()
+            self._register_events(account.phone, client)
+            self._clients[account.phone] = client
+            registered = True  # 已进池,交给池管理,后续不在此 disconnect
+            await run_db(
+                account_repo.mark_logged_in,
+                account.phone,
+                getattr(me, "id", None),
+                getattr(me, "first_name", None),
+                getattr(me, "last_name", None),
+                getattr(me, "username", None),
+            )
+            logger.info("小号 %s 重连成功 tg_user_id=%s", account.phone, getattr(me, "id", None))
+        finally:
+            # 未进池的 client(失效/异常)一律断开,防半开连接泄漏
+            if not registered:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    pass
 
     # ---------- 注册 / 注销 ----------
     def _register_events(self, phone: str, client: TelegramClient) -> None:

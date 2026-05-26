@@ -30,18 +30,18 @@ logger = logging.getLogger(__name__)
 
 # ---------- 消息上下文缓存 ----------
 class MessageCache:
-    """按 (chat_id, thread_id) 分桶,避免同群多 Forum Topic 的上下文串台。"""
+    """按 chat_id 分桶缓存最近消息(普通群,一群一话题)。"""
 
     def __init__(self, window: int = CONTEXT_WINDOW) -> None:
         self._window = window
-        self._data: Dict[tuple[int, int], Deque[str]] = defaultdict(lambda: deque(maxlen=window))
+        self._data: Dict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=window))
 
-    def add(self, chat_id: int, thread_id: int, sender: str, text: str) -> None:
+    def add(self, chat_id: int, sender: str, text: str) -> None:
         if text:
-            self._data[(chat_id, thread_id)].append(f"{sender}: {text}")
+            self._data[chat_id].append(f"{sender}: {text}")
 
-    def recent(self, chat_id: int, thread_id: int) -> List[str]:
-        return list(self._data.get((chat_id, thread_id), ()))
+    def recent(self, chat_id: int) -> List[str]:
+        return list(self._data.get(chat_id, ()))
 
 
 _cache = MessageCache()
@@ -152,25 +152,22 @@ async def _self_drive_tick() -> None:
 
 async def _emit_self(topic: dict, speaker: str) -> None:
     chat_id = topic["chat_id"]
-    thread_id = topic["message_thread_id"]
     persona = await _persona_of(speaker)
     # 附和短句(仅自驱)
     if topic["filler_enabled"] == 1 and random.randint(0, 99) < topic["filler_prob"]:
         text = ai_chat_engine.pick_filler(persona)
     else:
         text = await ai_chat_engine.generate_reply(
-            persona, topic["topic_prompt"], _cache.recent(chat_id, thread_id),
+            persona, topic["topic_prompt"], _cache.recent(chat_id),
             reply_target=None, topic_min=topic["reply_min_chars"], topic_max=topic["reply_max_chars"],
         )
     if not text:
         return
-    ok, _ = await message_sender.send_text(
-        speaker, chat_id, text, thread_id=thread_id, source=SendSource.AI_SELF,
-    )
+    ok, _ = await message_sender.send_text(speaker, chat_id, text, source=SendSource.AI_SELF)
     if ok:
         _topic_incr_minute(topic["id"])
         name = persona.get("name") or speaker
-        _cache.add(chat_id, thread_id, name, text)
+        _cache.add(chat_id, name, text)
 
 
 async def _check_owner(topic: dict) -> None:
@@ -197,9 +194,8 @@ async def on_message(phone: str, event) -> None:
     chat_id = event.chat_id
     if chat_id is None:
         return
-    thread_id = _event_thread_id(event)
-    # 找该群该 thread 的 running 话题
-    topic = await _find_running_topic(chat_id, thread_id)
+    # 找该群的 running 话题(一群一话题)
+    topic = await _find_running_topic(chat_id)
     if topic is None:
         return
 
@@ -219,7 +215,7 @@ async def on_message(phone: str, event) -> None:
     # 每个在管控小号的 client 都会收到这条;用 out 仅由发送方记录一次,避免重复入缓存。
     if sender_id in member_ids:
         if getattr(event, "out", False):
-            _cache.add(chat_id, thread_id, _member_name(member_ids, sender_id, event), text)
+            _cache.add(chat_id, _member_name(member_ids, sender_id, event), text)
         return
 
     # 真人发言:消息级去重(同一条消息会被多个 client 触发)
@@ -229,7 +225,7 @@ async def on_message(phone: str, event) -> None:
 
     # 记上下文(用真实发送者名)
     sender_name = getattr(getattr(event, "sender", None), "first_name", None) or "用户"
-    _cache.add(chat_id, thread_id, sender_name, text)
+    _cache.add(chat_id, sender_name, text)
 
     # 概率应答
     if random.randint(0, 99) >= topic["reply_user_prob"]:
@@ -246,7 +242,7 @@ async def on_message(phone: str, event) -> None:
 
     persona = await _persona_of(responder)
     reply = await ai_chat_engine.generate_reply(
-        persona, topic["topic_prompt"], _cache.recent(chat_id, thread_id),
+        persona, topic["topic_prompt"], _cache.recent(chat_id),
         reply_target=text, topic_min=topic["reply_min_chars"], topic_max=topic["reply_max_chars"],
     )
     if not reply:
@@ -256,33 +252,16 @@ async def on_message(phone: str, event) -> None:
     )
     if ok:
         _topic_incr_minute(topic["id"])
-        _cache.add(chat_id, thread_id, persona.get("name") or responder, reply)
+        _cache.add(chat_id, persona.get("name") or responder, reply)
 
 
-async def _find_running_topic(chat_id: int, thread_id: int) -> Optional[dict]:
-    """优先精确匹配 (chat_id, thread_id);找不到再回退仅 chat_id 匹配的话题。"""
+async def _find_running_topic(chat_id: int) -> Optional[dict]:
+    """找该群的 running 话题(普通群,一群一话题)。"""
     topics = await run_db(topic_repo.list_running)
-    same_chat = [t for t in topics if t["chat_id"] == chat_id]
-    for t in same_chat:
-        if t["message_thread_id"] == thread_id:
+    for t in topics:
+        if t["chat_id"] == chat_id:
             return t
-    # 回退:该群只有一个话题(常见的普通群独占场景),thread 解析不到也能命中
-    return same_chat[0] if same_chat else None
-
-
-def _event_thread_id(event) -> int:
-    """从消息事件解析 Forum Topic 的 thread_id;非 Forum / General 返回 0。"""
-    reply_to = getattr(getattr(event, "message", None), "reply_to", None)
-    if reply_to is None:
-        return 0
-    # forum 消息:reply_to_top_id 是 topic 根;若直接发在 topic 根则 reply_to_msg_id 即根
-    top = getattr(reply_to, "reply_to_top_id", None)
-    if top:
-        return int(top)
-    if getattr(reply_to, "forum_topic", False):
-        msg_id = getattr(reply_to, "reply_to_msg_id", None)
-        return int(msg_id) if msg_id else 0
-    return 0
+    return None
 
 
 def _member_name(member_ids: set, sender_id: int, event) -> str:

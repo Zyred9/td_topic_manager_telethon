@@ -32,7 +32,6 @@ async def send_text(
     chat_id: int,
     text: str,
     reply_to: Optional[int] = None,
-    thread_id: int = 0,
     source: SendSource = SendSource.AI_SELF,
 ) -> Tuple[bool, str]:
     client = client_manager.get_ready_client(phone)
@@ -50,12 +49,8 @@ async def send_text(
     if wait > 0:
         await asyncio.sleep(wait)
 
-    # Forum Topic 路由:引用具体消息时 reply_to 用该消息(天然落在其 topic);
-    # 否则若 thread_id>0(非 General)则发到该 topic 根消息。
-    effective_reply_to = reply_to if reply_to is not None else (thread_id or None)
-
     try:
-        await client.send_message(chat_id, text, reply_to=effective_reply_to)
+        await client.send_message(chat_id, text, reply_to=reply_to)
         throttle.mark_sent(phone)
         throttle.incr_minute(phone)
         return True, ""
@@ -63,7 +58,7 @@ async def send_text(
         logger.warning("[发送] phone=%s chat=%s FLOOD_WAIT %ss,退避重试", phone, chat_id, exc.seconds)
         await asyncio.sleep(exc.seconds + 1)
         try:
-            await client.send_message(chat_id, text, reply_to=effective_reply_to)
+            await client.send_message(chat_id, text, reply_to=reply_to)
             throttle.mark_sent(phone)
             throttle.incr_minute(phone)
             return True, ""

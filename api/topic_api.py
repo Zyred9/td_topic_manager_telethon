@@ -17,12 +17,6 @@ async def list_topics(_: CurrentUser = Depends(get_current_user)) -> dict:
     return result(await topic_service.list_topics())
 
 
-@router.get("/forum-chats")
-async def list_forum_chats(_: CurrentUser = Depends(get_current_user)) -> dict:
-    """已有话题用过的 Forum 群(供"在已有 Forum 群下新建子话题"选择)。"""
-    return result(await topic_service.list_forum_chats())
-
-
 @router.get("/{topic_id}")
 async def get_topic(topic_id: int, _: CurrentUser = Depends(get_current_user)) -> dict:
     try:

@@ -1,7 +1,6 @@
-"""AI 话题:CRUD + 建群 + 在群校验 + 乐观锁 + 移交群主。
+"""AI 话题:CRUD + 在群校验 + 乐观锁 + 移交群主。
 
-建群:由 owner 小号(成员中挑选)用 Telethon 原生 CreateChannel(megagroup) +
-ToggleForum 开 Forum。Bot 不参与。已有群则只校验在群。
+不建群:话题只接入已有的普通群(创建时填群 ID,校验小号在群、剔除不在群的)。
 """
 
 from __future__ import annotations
@@ -10,9 +9,8 @@ import logging
 from typing import List, Optional
 
 from telethon import errors
-from telethon.tl import functions, types
+from telethon.tl import types
 from telethon.tl.tlobject import TLRequest
-from telethon.utils import get_peer_id
 
 from config.constants import TaskStatus
 from core.client_manager import client_manager
@@ -115,15 +113,6 @@ async def list_topics() -> List[dict]:
     return result
 
 
-async def list_forum_chats() -> List[dict]:
-    """供前端"在已有 Forum 群下新建子话题"下拉:返回去重的 Forum 群 [{chatId, chatTitle}]。"""
-    rows = await run_db(topic_repo.list_forum_chats)
-    return [
-        {"chatId": r["chat_id"], "chatTitle": r.get("chat_title") or str(r["chat_id"])}
-        for r in rows
-    ]
-
-
 async def get_topic(topic_id: int) -> dict:
     row = await run_db(topic_repo.find_by_id, topic_id)
     if row is None:
@@ -146,50 +135,21 @@ async def create_topic(req) -> dict:
            for k, v in _DEFAULTS.items()}
     _validate_chars(cfg["reply_min_chars"], cfg["reply_max_chars"])
 
-    # 群入口模式:兼容旧调用(无 chatMode 时按有无 chatId 推断)
-    mode = req.chatMode or ("existing_chat" if req.chatId is not None else "new_forum")
-
-    if mode == "new_forum":
-        # 新建 Forum 群 + 建首个子话题
-        owner_phone, chat_id, thread_id, members = await _create_group(
-            req.topicName, req.topicPrompt, req.topicName, phones,
-        )
-        skipped = [p for p in phones if p not in members]
-
-    elif mode == "existing_forum":
-        # 已有 Forum 群下新建子话题
-        if req.chatId is None:
-            raise TopicError("请选择已有的 Forum 群")
-        in_phones, skipped = await _filter_in_group(phones, req.chatId)
-        if not in_phones:
-            raise TopicError("所选小号均不在该群,无法创建话题")
-        chat_id = req.chatId
-        owner_phone = await _pick_owner(in_phones)
-        owner_client = client_manager.get_ready_client(owner_phone)
-        peer = await owner_client.get_input_entity(chat_id)
-        thread_id = await _create_forum_topic(owner_client, peer, req.topicName)
-        if not thread_id:
-            raise TopicError("在该群创建子话题失败,请确认它是 Forum 群且小号有权限")
-        members = in_phones
-        for p in members:
-            await run_db(account_watch_repo.add, p, chat_id)
-
-    else:  # existing_chat:接入已有普通群(不带子话题)
-        if req.chatId is None:
-            raise TopicError("请填写群 ID")
-        in_phones, skipped = await _filter_in_group(phones, req.chatId)
-        if not in_phones:
-            raise TopicError("所选小号均不在该群,无法创建话题")
-        chat_id = req.chatId
-        owner_phone = await _pick_owner(in_phones)
-        thread_id = req.messageThreadId or 0
-        members = in_phones
-        for p in members:
-            await run_db(account_watch_repo.add, p, chat_id)
+    # 接入已有普通群:必须填群 ID,校验小号在群,剔除不在群的
+    if req.chatId is None:
+        raise TopicError("请填写群 ID")
+    in_phones, skipped = await _filter_in_group(phones, req.chatId)
+    if not in_phones:
+        raise TopicError("所选小号均不在该群,无法创建话题")
+    chat_id = req.chatId
+    owner_phone = await _pick_owner(in_phones)
+    members = in_phones
+    for p in members:
+        await run_db(account_watch_repo.add, p, chat_id)
 
     data = {
         "topic_name": req.topicName, "topic_prompt": req.topicPrompt,
-        "owner_phone": owner_phone, "chat_id": chat_id, "message_thread_id": thread_id,
+        "owner_phone": owner_phone, "chat_id": chat_id, "message_thread_id": 0,
         "speak_min_sec": cfg["speak_min_sec"], "speak_max_sec": cfg["speak_max_sec"],
         "reply_user_prob": cfg["reply_user_prob"], "max_per_min": cfg["max_per_min"],
         "reply_min_chars": cfg["reply_min_chars"], "reply_max_chars": cfg["reply_max_chars"],
@@ -294,92 +254,6 @@ async def _make_password(client, password: str):
     pwd = await client(fns.account.GetPasswordRequest())
     from telethon.password import compute_check
     return compute_check(pwd, password)
-
-
-# ---------- 建群 ----------
-async def _create_group(title: str, prompt: str, topic_title: str, phones: List[str]):
-    """新建 Forum 超级群,拉成员,并在其下建首个子话题。返回 (owner, chat_id, thread_id, members)。"""
-    owner_phone = await _pick_owner(phones)
-    owner_client = client_manager.get_ready_client(owner_phone)
-    if owner_client is None:
-        raise TopicError("群主小号未就绪,无法建群")
-
-    # 1. 建超级群
-    created = await owner_client(functions.channels.CreateChannelRequest(
-        title=title, about=(prompt or "")[:255], megagroup=True,
-    ))
-    channel = created.chats[0]
-    chat_id = get_peer_id(channel)
-
-    # 2. 开 Forum
-    forum_ok = True
-    try:
-        await owner_client(functions.channels.ToggleForumRequest(channel=channel, enabled=True))
-    except Exception as exc:
-        forum_ok = False
-        logger.warning("开启 Forum 失败(回退 General Topic): %s", exc)
-
-    # 3. 拉其他成员
-    members = [owner_phone]
-    others = [p for p in phones if p != owner_phone]
-    users = []
-    for p in others:
-        c = client_manager.get_ready_client(p)
-        if c is None:
-            continue
-        try:
-            me = await c.get_me()
-            users.append(types.InputUser(user_id=me.id, access_hash=me.access_hash or 0))
-            members.append(p)
-        except Exception as exc:
-            logger.warning("解析成员 %s 失败,跳过: %s", p, exc)
-    if users:
-        try:
-            await owner_client(functions.channels.InviteToChannelRequest(channel=channel, users=users))
-        except Exception as exc:
-            logger.warning("批量拉成员部分失败: %s", exc)
-
-    # 4. 建首个子话题(Forum 开成功才建,否则用 General thread_id=0)
-    thread_id = 0
-    if forum_ok:
-        thread_id = await _create_forum_topic(owner_client, channel, topic_title)
-
-    # 记录在群路由
-    for p in members:
-        await run_db(account_watch_repo.add, p, chat_id, title)
-
-    return owner_phone, chat_id, thread_id, members
-
-
-async def _create_forum_topic(owner_client, peer, topic_title: str) -> int:
-    """在 Forum 群下新建一个子话题,返回其 thread_id(=该 topic 根消息 id)。失败返回 0。"""
-    import random as _r
-    try:
-        updates = await owner_client(functions.messages.CreateForumTopicRequest(
-            peer=peer,
-            title=(topic_title or "话题")[:128],
-            random_id=_r.randrange(-(2**63), 2**63),
-        ))
-        thread_id = _extract_message_id(updates)
-        if thread_id:
-            return thread_id
-        logger.warning("建子话题成功但未解析到 thread_id,回退 General")
-    except Exception as exc:
-        logger.warning("建 Forum 子话题失败(回退 General Topic): %s", exc)
-    return 0
-
-
-def _extract_message_id(updates) -> int:
-    """从 CreateForumTopic 返回的 Updates 里提取新建 topic 的根消息 id(即 thread_id)。"""
-    for upd in getattr(updates, "updates", []) or []:
-        # UpdateMessageID 直接带 id;其它带 message 的更新取 message.id
-        mid = getattr(upd, "id", None)
-        if mid:
-            return int(mid)
-        msg = getattr(upd, "message", None)
-        if msg is not None and getattr(msg, "id", None):
-            return int(msg.id)
-    return 0
 
 
 async def _pick_owner(phones: List[str]) -> str:

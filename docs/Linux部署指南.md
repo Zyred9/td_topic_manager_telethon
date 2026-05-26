@@ -3,7 +3,7 @@
 > 适用:**CentOS 9 Stream**(命令以此为准;Ubuntu/Debian 把 `dnf` 换成 `apt`、nginx 用户换 `www-data` 即可)
 > 海外服务器(能直连 Telegram)
 > 架构:Nginx 反代 → 前端静态文件 + 后端 uvicorn(8813)
-> 前提:服务器有 root/sudo,已装或将装 MySQL 8
+> 前提:服务器有 root/sudo,**已有可用的 MySQL**(本项目不含 MySQL 安装,自行准备)
 >
 > CentOS 9 三个易踩点:① 包管理用 `dnf`;② Nginx 运行用户是 `nginx`;③ **SELinux 默认开启,会拦 Nginx 反代后端**(见 §四 Q2 必做)。
 
@@ -66,27 +66,22 @@ cd /home/bot/td_topic_manager_telethon
 
 ```bash
 cd /home/bot/td_topic_manager_telethon
+
+# 新版 conda 首次用官方源会报 "Terms of Service have not been accepted",
+# 先接受两个官方 channel 的 ToS(一次即可,以后不再提示):
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
+conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+
 conda create -n td_topic python=3.13 -y
 conda activate td_topic
 pip install --upgrade pip
 pip install -r requirements.txt
 
-# 记下环境里 python 的绝对路径,systemd 要用(见 1.7):
+# 记下环境里 python 的绝对路径,systemd 要用(见 1.6):
 which python        # 形如 /root/miniconda3/envs/td_topic/bin/python
 ```
 
-### 1.4 装 MySQL(若未装)
-
-```bash
-sudo dnf install -y mysql-server
-sudo systemctl enable --now mysqld          # CentOS 9 服务名是 mysqld
-# 设置 root 密码(.env 里 DB_PASSWORD 用这个值)
-sudo mysql -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'Qj683k2^11299%nkjb';"
-```
-库不用手动建,后端启动会自动 `CREATE DATABASE IF NOT EXISTS` 并建表。
-> `.env` 里的 `DB_PASSWORD` 要和这里设的一致(本仓库 .env 已设为 `Qj683k2^11299%nkjb`)。
-
-### 1.5 确认 / 调整 .env
+### 1.4 确认 / 调整 .env
 
 `.env` 已随仓库 clone 下来(私有仓库已含配置),通常**无需新建**。只在服务器实际值不同时调整:
 
@@ -98,7 +93,11 @@ vi .env
 按需确认这几项(改本地 .env 不会被 git pull 覆盖,因为 pull 只更新已跟踪文件的远端变更;若你本地改了又不想冲突,更新前 `git stash` 一下):
 
 ```bash
-DB_PASSWORD=Qj683k2^11299%nkjb         # 已设;与服务器 MySQL root 密码一致
+DB_HOST=127.0.0.1                      # 指向你已有的 MySQL(本机或远程地址)
+DB_PORT=3306
+DB_USER=root
+DB_PASSWORD=Qj683k2^11299%nkjb         # 改成你 MySQL 实际密码
+DB_NAME=td_topic_manager               # 库不用手动建,启动会自动 CREATE IF NOT EXISTS
 JWT_SECRET=...                         # 生产建议换随机串:openssl rand -hex 32
 INIT_ADMIN_PASSWORD=...                # 首次启动建超管用,登录后再改
 LLM_API_KEY=sk-...                     # deepseek key(已有值,确认有效)
@@ -106,7 +105,9 @@ LLM_API_KEY=sk-...                     # deepseek key(已有值,确认有效)
 # TD_PROXY_HOST= / TD_PROXY_PORT=  保持注释
 ```
 
-### 1.6 先手动跑一次验证
+> 本项目用你**已有的 MySQL**,不在此教安装。确保 MySQL 已运行、上面的账号密码能连、且该账号有建库权限即可。
+
+### 1.5 先手动跑一次验证
 
 ```bash
 cd /home/bot/td_topic_manager_telethon
@@ -118,7 +119,7 @@ curl http://127.0.0.1:8813/collect/openapi.json    # 返回 JSON 即后端正常
 # Ctrl+C 停掉,改用下面的 systemd 守护
 ```
 
-### 1.7 systemd 守护(开机自启 + 崩溃重启)
+### 1.6 systemd 守护(开机自启 + 崩溃重启)
 
 ```bash
 sudo vi /etc/systemd/system/td-backend.service
@@ -153,6 +154,35 @@ tail -f /home/bot/td_topic_manager_telethon/backend.log               # 实时�
 
 > 注意:**服务重启后所有定时任务/AI 话题自动置停**(需求设计),需运营登录后台手动重启任务。
 > 小号(已登录的 session)会在启动时自动全起重连。
+
+### 1.7 日常更新后端代码(本地 push → 服务器 pull)
+
+开发机改完代码推到 GitHub:
+
+```bash
+# 开发机
+cd D:/open_workspace/td_topic_manager_telethon
+git add <改动的文件>
+git commit -m "说明"
+git push
+```
+
+服务器拉取并重启:
+
+```bash
+cd /home/bot/td_topic_manager_telethon
+git pull
+# 若依赖(requirements.txt)有变更:
+conda activate td_topic && pip install -r requirements.txt
+# 重启服务生效
+sudo systemctl restart td-backend
+tail -f /home/bot/td_topic_manager_telethon/backend.log
+```
+
+> **.env 冲突处理**:服务器上若手动改过 `.env`,而远端 `.env` 也变了,`git pull` 会冲突。
+> 处理:`git stash` → `git pull` → `git stash pop`(必要时手动解冲突);
+> 或让远端为准:`git checkout -- .env && git pull`。
+> `sessions/`、`data/` 在 `.gitignore` 里,`git pull` 不会动它们,小号登录态安全。
 
 ---
 

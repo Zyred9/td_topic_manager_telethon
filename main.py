@@ -13,6 +13,7 @@ from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -66,17 +67,22 @@ async def lifespan(app: FastAPI):
     # 启动话题自驱调度器(话题需运营手动 start 才会真正发言)
     topic_scheduler.start_scheduler()
 
+    # 启动小号健康巡检(周期检测在线/授权状态 + 同步实时资料)
+    from services import account_watch_service
+    account_watch_service.start_watch()
+
     logger.info("=" * 50)
     logger.info("服务启动完成,根路径 %s,端口 %s", settings.server.root_path, settings.server.port)
     logger.info("=" * 50)
 
     yield
 
-    # 关闭:停调度器 + 后台任务 + 断开所有 client
+    # 关闭:停调度器 + 巡检 + 后台任务 + 断开所有 client
     from core.client_manager import client_manager
     from core.lifecycle import task_tracker
-    from services import topic_scheduler
+    from services import account_watch_service, topic_scheduler
     await topic_scheduler.stop_scheduler()
+    await account_watch_service.stop_watch()
     await task_tracker.cancel_all()
     await client_manager.shutdown()
     logger.info("服务已关闭")
@@ -96,6 +102,13 @@ def create_app() -> FastAPI:
     @app.exception_handler(BizError)
     async def _biz_error_handler(_: Request, exc: BizError) -> JSONResponse:
         return JSONResponse(status_code=200, content=result(code=exc.code, message=exc.message))
+
+    # 请求参数校验失败 → 200 + {code:400}(FastAPI 默认返回 HTTP 422,会绕过下方兜底
+    # Exception handler,导致前端拦截器把它当"网络异常"致列表整页空白,故单独接住)
+    @app.exception_handler(RequestValidationError)
+    async def _validation_error_handler(_: Request, exc: RequestValidationError) -> JSONResponse:
+        logger.warning("请求参数校验失败: %s", exc.errors())
+        return JSONResponse(status_code=200, content=result(code=400, message="请求参数错误"))
 
     # 兜底异常
     @app.exception_handler(Exception)

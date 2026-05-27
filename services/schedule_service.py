@@ -94,6 +94,49 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
         logger.exception("定时发送循环异常 phone=%s", phone)
 
 
+# ---------- 批量(统一一份配置下发) ----------
+async def batch_start(phones: List[str], chat_ids: List[int], content: str, interval_min: int) -> dict:
+    """对所有勾选小号下发同一份定时配置并启动。逐号隔离,返回成功/失败列表。
+
+    未就绪(未登录/离线)的号跳过并记入 failed,不阻断其它号。
+    """
+    from core.client_manager import client_manager
+
+    ok: List[str] = []
+    failed: List[dict] = []
+    for raw in phones:
+        phone = _normalize(raw)
+        if client_manager.get_ready_client(phone) is None:
+            failed.append({"phone": phone, "reason": "小号未就绪(未登录/离线)"})
+            continue
+        try:
+            await start(phone, chat_ids, content, interval_min)
+            ok.append(phone)
+        except ValueError as exc:
+            failed.append({"phone": phone, "reason": str(exc)})
+        except Exception as exc:
+            logger.warning("批量启动定时失败 phone=%s", phone, exc_info=exc)
+            failed.append({"phone": phone, "reason": "启动异常"})
+    logger.info("批量定时启动 成功=%d 失败=%d", len(ok), len(failed))
+    return {"ok": ok, "failed": failed}
+
+
+async def batch_stop(phones: List[str]) -> dict:
+    """批量停止勾选小号的定时任务。逐号隔离,返回成功/失败列表。"""
+    ok: List[str] = []
+    failed: List[dict] = []
+    for raw in phones:
+        phone = _normalize(raw)
+        try:
+            await stop(phone)
+            ok.append(phone)
+        except Exception as exc:
+            logger.warning("批量停止定时失败 phone=%s", phone, exc_info=exc)
+            failed.append({"phone": phone, "reason": "停止异常"})
+    logger.info("批量定时停止 成功=%d 失败=%d", len(ok), len(failed))
+    return {"ok": ok, "failed": failed}
+
+
 async def stop_all_on_startup() -> None:
     """服务启动:DB 全置停(不自动恢复任务)。"""
     await run_db(schedule_repo.stop_all_on_startup)

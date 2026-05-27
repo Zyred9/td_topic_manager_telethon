@@ -71,6 +71,24 @@ class ScheduleStartReq(BaseModel):
     intervalMin: int
 
 
+class ScheduleBatchStartReq(BaseModel):
+    """批量定时发送:统一一份配置下发给所有勾选小号。"""
+    phones: List[str]
+    chatIds: List[int]
+    content: str
+    intervalMin: int
+
+
+class ScheduleBatchStopReq(BaseModel):
+    phones: List[str]
+
+
+# ========== dm 私聊记录 ==========
+class DmMessageDeleteReq(BaseModel):
+    """批量删除私聊消息(按 DB 主键 id)。"""
+    ids: List[int]
+
+
 # ========== keyword ==========
 class KeywordReq(BaseModel):
     keyword: str

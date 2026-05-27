@@ -52,9 +52,30 @@ def _to_vo(acc) -> dict:
     }
 
 
-async def list_accounts(page_no: int, size: int, keyword: Optional[str], status: Optional[int]) -> dict:
-    records, total = await run_db(account_repo.page, page_no, size, keyword, status)
+async def list_accounts(page_no: int, size: int, keyword: Optional[str], status=None) -> dict:
+    # keyword/status 容错:空串、纯空白、非法数字一律视为"不过滤"(None),避免前端
+    # 清空筛选传空串时报错或误过滤掉全部号。
+    kw = keyword.strip() if isinstance(keyword, str) else keyword
+    if not kw:
+        kw = None
+    status_val = _parse_status(status)
+    records, total = await run_db(account_repo.page, page_no, size, kw, status_val)
     return {"page": page_no, "size": size, "total": total, "records": [_to_vo(a) for a in records]}
+
+
+def _parse_status(status) -> Optional[int]:
+    """状态筛选容错:None/空串/非法值 → None(不过滤),合法数字 → int。"""
+    if status is None:
+        return None
+    if isinstance(status, int):
+        return status
+    text = str(status).strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError:
+        return None
 
 
 async def list_groups(phone: str, page_no: int, size: int) -> dict:

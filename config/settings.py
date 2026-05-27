@@ -89,6 +89,13 @@ class RiskConfig:
 
 
 @dataclass(frozen=True)
+class WatchConfig:
+    """小号健康巡检参数:周期检测在线/授权状态并同步实时资料。"""
+
+    interval_min: int
+
+
+@dataclass(frozen=True)
 class ProxyConfig:
     """SOCKS5 代理,暂不接,留空即直连。"""
 
@@ -108,6 +115,7 @@ class Settings:
     llm: LlmConfig
     auth: AuthConfig
     risk: RiskConfig
+    watch: WatchConfig
     proxy: ProxyConfig
     base_dir: Path = field(default=BASE_DIR)
 
@@ -178,6 +186,9 @@ def get_settings() -> Settings:
             join_jitter_max_sec=_get_int("JOIN_BATCH_JITTER_MAX_SEC", 15),
             new_account_daily_max=_get_int("NEW_ACCOUNT_DAILY_MAX", 3),
             owner_offline_threshold_sec=_get_int("TOPIC_OWNER_OFFLINE_THRESHOLD_SEC", 300),
+        ),
+        watch=WatchConfig(
+            interval_min=_get_int("ACCOUNT_WATCH_INTERVAL_MIN", 15),
         ),
         proxy=ProxyConfig(
             host=os.getenv("TD_PROXY_HOST") or None,

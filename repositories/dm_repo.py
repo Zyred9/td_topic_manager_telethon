@@ -79,10 +79,90 @@ def page_messages(phone: str, peer_user_id: int, page_no: int, size: int) -> Tup
             )
             total = int(cur.fetchone()["cnt"])
             cur.execute(
-                "SELECT tg_msg_id, msg_type, content, media_path, media_size, media_note, msg_time "
+                "SELECT id, tg_msg_id, msg_type, content, media_path, media_size, media_note, msg_time "
                 "FROM t_dm_message WHERE phone=%s AND peer_user_id=%s "
                 "ORDER BY msg_time DESC, id DESC LIMIT %s OFFSET %s",
                 (phone, peer_user_id, size, offset),
             )
             rows = cur.fetchall()
     return rows, total
+
+
+# ---------- 删除(只删后台记录,不动 Telegram) ----------
+def delete_messages_by_ids(ids: List[int]) -> Tuple[int, List[str]]:
+    """按消息主键批量删除。返回 (受影响行数, 被删消息的 media_path 列表)。
+
+    删除后重算受影响 peer 的 msg_count/last_msg_time,保持计数与列表一致。
+    """
+    if not ids:
+        return 0, []
+    placeholders = ",".join(["%s"] * len(ids))
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            # 先取待删消息的 media_path 与归属 peer(供清文件 + 重算计数)
+            cur.execute(
+                f"SELECT media_path, phone, peer_user_id FROM t_dm_message WHERE id IN ({placeholders})",
+                tuple(ids),
+            )
+            rows = cur.fetchall()
+            media_paths = [r["media_path"] for r in rows if r.get("media_path")]
+            peers = {(r["phone"], r["peer_user_id"]) for r in rows}
+            cur.execute(f"DELETE FROM t_dm_message WHERE id IN ({placeholders})", tuple(ids))
+            affected = int(cur.rowcount)
+            for phone, peer_user_id in peers:
+                _recount_peer(cur, phone, peer_user_id)
+    return affected, media_paths
+
+
+def delete_peer(phone: str, peer_user_id: int) -> Tuple[int, List[str]]:
+    """删除某对象的全部消息 + 对象本身。返回 (删除消息数, media_path 列表)。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT media_path FROM t_dm_message WHERE phone=%s AND peer_user_id=%s",
+                (phone, peer_user_id),
+            )
+            media_paths = [r["media_path"] for r in cur.fetchall() if r.get("media_path")]
+            cur.execute(
+                "DELETE FROM t_dm_message WHERE phone=%s AND peer_user_id=%s",
+                (phone, peer_user_id),
+            )
+            affected = int(cur.rowcount)
+            cur.execute(
+                "DELETE FROM t_dm_peer WHERE phone=%s AND peer_user_id=%s",
+                (phone, peer_user_id),
+            )
+    return affected, media_paths
+
+
+def delete_all_by_phone(phone: str) -> Tuple[int, List[str]]:
+    """删除某小号的全部私聊(所有消息 + 所有对象)。返回 (删除消息数, media_path 列表)。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT media_path FROM t_dm_message WHERE phone=%s", (phone,))
+            media_paths = [r["media_path"] for r in cur.fetchall() if r.get("media_path")]
+            cur.execute("DELETE FROM t_dm_message WHERE phone=%s", (phone,))
+            affected = int(cur.rowcount)
+            cur.execute("DELETE FROM t_dm_peer WHERE phone=%s", (phone,))
+    return affected, media_paths
+
+
+def _recount_peer(cur, phone: str, peer_user_id: int) -> None:
+    """重算某 peer 的 msg_count/last_msg_time;无消息则删除该 peer 行。"""
+    cur.execute(
+        "SELECT COUNT(*) AS cnt, MAX(msg_time) AS last_time "
+        "FROM t_dm_message WHERE phone=%s AND peer_user_id=%s",
+        (phone, peer_user_id),
+    )
+    row = cur.fetchone()
+    cnt = int(row["cnt"]) if row else 0
+    if cnt == 0:
+        cur.execute(
+            "DELETE FROM t_dm_peer WHERE phone=%s AND peer_user_id=%s",
+            (phone, peer_user_id),
+        )
+        return
+    cur.execute(
+        "UPDATE t_dm_peer SET msg_count=%s, last_msg_time=%s WHERE phone=%s AND peer_user_id=%s",
+        (cnt, row["last_time"], phone, peer_user_id),
+    )

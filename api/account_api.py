@@ -20,9 +20,11 @@ router = APIRouter(prefix="/account", tags=["account"])
 
 @router.get("/list")
 async def list_accounts(
-    page: int = 1, size: int = 10, keyword: str | None = None, status: int | None = None,
+    page: int = 1, size: int = 10, keyword: str | None = None, status: str | None = None,
     _: CurrentUser = Depends(get_current_user),
 ) -> dict:
+    # status 收字符串而非 int:前端清空筛选后可能传空串 ?status=,用 int 类型会触发
+    # 422 校验失败致列表整页空白。统一在 service 层把空串/非法值当作"不过滤"。
     data = await account_service.list_accounts(page, size, keyword, status)
     return result(data)
 

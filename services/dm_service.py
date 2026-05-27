@@ -177,6 +177,7 @@ async def list_messages(phone: str, peer_user_id: int, page_no: int, size: int) 
     rows, total = await run_db(dm_repo.page_messages, phone, peer_user_id, page_no, size)
     records = [
         {
+            "id": r["id"],  # DB 主键,供前端勾选删除
             "tgMsgId": r["tg_msg_id"],
             "msgType": r["msg_type"],
             "content": r["content"],
@@ -189,6 +190,52 @@ async def list_messages(phone: str, peer_user_id: int, page_no: int, size: int) 
         for r in rows
     ]
     return {"page": page_no, "size": size, "total": total, "records": records}
+
+
+# ---------- 删除(只删后台记录,不动 Telegram) ----------
+async def delete_messages(ids: list) -> int:
+    """批量删除指定消息(按 DB 主键),清理对应本地媒体文件。返回删除条数。"""
+    clean_ids = [int(i) for i in ids if i is not None]
+    if not clean_ids:
+        return 0
+    affected, media_paths = await run_db(dm_repo.delete_messages_by_ids, clean_ids)
+    _remove_media_files(media_paths)
+    logger.info("[私聊] 删除消息 %d 条", affected)
+    return affected
+
+
+async def delete_peer(phone: str, peer_user_id: int) -> int:
+    """删除某私聊对象及其全部消息,清理本地媒体文件。返回删除消息条数。"""
+    phone = _normalize(phone)
+    affected, media_paths = await run_db(dm_repo.delete_peer, phone, int(peer_user_id))
+    _remove_media_files(media_paths)
+    logger.info("[私聊] 删除对象 phone=%s peer=%s 消息 %d 条", phone, peer_user_id, affected)
+    return affected
+
+
+async def delete_all(phone: str) -> int:
+    """清空某小号的全部私聊记录,清理本地媒体文件。返回删除消息条数。"""
+    phone = _normalize(phone)
+    affected, media_paths = await run_db(dm_repo.delete_all_by_phone, phone)
+    _remove_media_files(media_paths)
+    logger.info("[私聊] 清空小号私聊 phone=%s 消息 %d 条", phone, affected)
+    return affected
+
+
+def _remove_media_files(media_paths: list) -> None:
+    """删除媒体相对路径对应的本地文件;单个失败只记日志不中断(参考删 session 文件)。"""
+    if not media_paths:
+        return
+    media_dir = get_settings().media_dir
+    for rel in media_paths:
+        if not rel:
+            continue
+        try:
+            f = media_dir / rel
+            if f.exists():
+                f.unlink()
+        except Exception as exc:
+            logger.warning("[私聊] 删除媒体文件失败 path=%s", rel, exc_info=exc)
 
 
 def register() -> None:

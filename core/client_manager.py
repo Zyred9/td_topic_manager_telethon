@@ -139,11 +139,19 @@ class ClientManager:
             except Exception:
                 logger.warning("断开 client 失败 phone=%s", phone)
 
+    # 单个 client disconnect 超时(秒):防 Telethon 半开连接阻塞拖住整个服务关闭
+    _DISCONNECT_TIMEOUT = 5.0
+
     async def shutdown(self) -> None:
-        """服务关闭:断开所有 client。"""
+        """服务关闭:断开所有 client。逐个加超时,半开连接超时即放弃(进程退出由 OS 回收)。"""
         phones = list(self._clients.keys())
         for phone in phones:
-            await self.remove(phone)
+            try:
+                await asyncio.wait_for(self.remove(phone), timeout=self._DISCONNECT_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("断开 client 超时(%.0fs),跳过 phone=%s", self._DISCONNECT_TIMEOUT, phone)
+            except Exception as exc:
+                logger.warning("断开 client 异常 phone=%s", phone, exc_info=exc)
         logger.info("已断开全部 %d 个小号 client", len(phones))
 
 

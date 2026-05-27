@@ -77,12 +77,13 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    # 关闭:停调度器 + 巡检 + 后台任务 + 断开所有 client
+    # 关闭:停调度器 + 巡检 + 定时发送 + 后台任务 + 断开所有 client
     from core.client_manager import client_manager
     from core.lifecycle import task_tracker
-    from services import account_watch_service, topic_scheduler
+    from services import account_watch_service, schedule_service, topic_scheduler
     await topic_scheduler.stop_scheduler()
     await account_watch_service.stop_watch()
+    await schedule_service.cancel_all_tasks()
     await task_tracker.cancel_all()
     await client_manager.shutdown()
     logger.info("服务已关闭")

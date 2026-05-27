@@ -137,6 +137,20 @@ async def batch_stop(phones: List[str]) -> dict:
     return {"ok": ok, "failed": failed}
 
 
+async def cancel_all_tasks() -> None:
+    """服务关闭:取消所有运行中的定时发送协程(不改 DB 状态)。
+
+    定时任务用 asyncio.create_task 自管理,不在 task_tracker 内,关闭时必须显式
+    取消,否则这些 while True 协程不会结束,uvicorn 会一直卡在
+    "Waiting for background tasks to complete"。
+    """
+    phones = list(_tasks.keys())
+    for phone in phones:
+        await _cancel_task(phone)
+    if phones:
+        logger.info("已取消 %d 个运行中的定时发送任务", len(phones))
+
+
 async def stop_all_on_startup() -> None:
     """服务启动:DB 全置停(不自动恢复任务)。"""
     await run_db(schedule_repo.stop_all_on_startup)

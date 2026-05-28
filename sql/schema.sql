@@ -21,9 +21,13 @@ CREATE TABLE IF NOT EXISTS t_account (
   status        TINYINT      NOT NULL DEFAULT 0 COMMENT '0未登录 1初始化中 2等待验证码 3已登录 4离线 5需重新登录 6等待2FA',
   login_time    DATETIME              COMMENT '最近一次登录成功时间',
   persona_json  TEXT                  COMMENT 'AI 人设 JSON',
+  is_dead       TINYINT      NOT NULL DEFAULT 0 COMMENT '0正常 1已失效(死号,默认从主列表过滤)',
+  dead_reason   VARCHAR(255)          COMMENT '失效原因(Telethon 异常类名+描述)',
+  dead_time     DATETIME              COMMENT '判定失效时间',
   create_time   DATETIME     NOT NULL,
   update_time   DATETIME     NOT NULL,
-  UNIQUE KEY uk_phone (phone)
+  UNIQUE KEY uk_phone (phone),
+  INDEX idx_is_dead (is_dead)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='小号';
 
 CREATE TABLE IF NOT EXISTS t_schedule_task (
@@ -156,3 +160,17 @@ CREATE TABLE IF NOT EXISTS t_dm_message (
   INDEX idx_phone_peer (phone, peer_user_id),
   INDEX idx_msg_time (msg_time)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='私聊消息(只记收到的一对一)';
+
+CREATE TABLE IF NOT EXISTS t_send_log (
+  id              BIGINT      PRIMARY KEY AUTO_INCREMENT,
+  phone           VARCHAR(32) NOT NULL COMMENT '发送方小号',
+  chat_id         BIGINT      NOT NULL COMMENT '目标群/对话 ID',
+  source          VARCHAR(16) NOT NULL COMMENT 'SCHEDULE/AI_SELF/AI_REPLY/KEYWORD',
+  ok              TINYINT     NOT NULL COMMENT '1成功 0失败',
+  err_code        VARCHAR(64)         COMMENT 'Telethon 异常类名 or NOT_READY/QUOTA_FULL',
+  err_message     TEXT                COMMENT '完整原始异常文本 repr(exc)',
+  content_preview VARCHAR(200)        COMMENT '消息前 200 字,便于定位是哪条',
+  send_time       DATETIME    NOT NULL COMMENT '发送时间(成功/失败均记)',
+  INDEX idx_phone_time (phone, send_time),
+  INDEX idx_ok_time (ok, send_time)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='发送日志(成功失败都记,前端按号查)';

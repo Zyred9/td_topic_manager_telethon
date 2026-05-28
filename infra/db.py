@@ -143,12 +143,32 @@ def _column_exists(cursor, table: str, column: str) -> bool:
     return bool(row and row["cnt"])
 
 
+def _index_exists(cursor, table: str, index: str) -> bool:
+    cursor.execute(
+        "SELECT COUNT(*) AS cnt FROM information_schema.statistics "
+        "WHERE table_schema = DATABASE() AND table_name = %s AND index_name = %s",
+        (table, index),
+    )
+    row = cursor.fetchone()
+    return bool(row and row["cnt"])
+
+
 def _run_migrations() -> None:
     """对已存在的老库做幂等补列(新库 schema.sql 已含,跳过)。"""
     migrations = [
         ("t_account_watch", "chat_title",
          "ALTER TABLE t_account_watch ADD COLUMN chat_title VARCHAR(255) "
          "COMMENT '群名(加群时回填,展示用)' AFTER chat_id"),
+        # 死号标记三列 + 索引(2026-05-28:加发送日志 + 死号列表)
+        ("t_account", "is_dead",
+         "ALTER TABLE t_account ADD COLUMN is_dead TINYINT NOT NULL DEFAULT 0 "
+         "COMMENT '0正常 1已失效(死号,默认从主列表过滤)' AFTER persona_json"),
+        ("t_account", "dead_reason",
+         "ALTER TABLE t_account ADD COLUMN dead_reason VARCHAR(255) "
+         "COMMENT '失效原因(Telethon 异常类名+描述)' AFTER is_dead"),
+        ("t_account", "dead_time",
+         "ALTER TABLE t_account ADD COLUMN dead_time DATETIME "
+         "COMMENT '判定失效时间' AFTER dead_reason"),
     ]
     with get_connection() as connection:
         with connection.cursor() as cursor:
@@ -156,3 +176,8 @@ def _run_migrations() -> None:
                 if not _column_exists(cursor, table, column):
                     cursor.execute(ddl)
                     logger.info("迁移:%s 新增列 %s", table, column)
+            # 索引补建(列已存在但旧库索引未建时)
+            if (_column_exists(cursor, "t_account", "is_dead")
+                    and not _index_exists(cursor, "t_account", "idx_is_dead")):
+                cursor.execute("ALTER TABLE t_account ADD INDEX idx_is_dead (is_dead)")
+                logger.info("迁移:t_account 新增索引 idx_is_dead")

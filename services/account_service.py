@@ -23,7 +23,7 @@ from core.client_manager import client_manager
 from core.throttle import throttle
 from infra import telethon_factory
 from infra.db import get_connection, run_db
-from repositories import account_repo, account_watch_repo
+from repositories import account_repo, account_watch_repo, send_log_repo
 
 logger = logging.getLogger(__name__)
 
@@ -49,17 +49,33 @@ def _to_vo(acc) -> dict:
         "statusDesc": account_status_desc(acc.status),
         "bio": acc.bio,
         "loginTime": acc.login_time.strftime("%Y-%m-%d %H:%M:%S") if acc.login_time else None,
+        # 死号字段,前端用于双标签与失效时间列展示
+        "isDead": int(acc.is_dead) == 1,
+        "deadReason": acc.dead_reason,
+        "deadTime": acc.dead_time.strftime("%Y-%m-%d %H:%M:%S") if acc.dead_time else None,
     }
 
 
-async def list_accounts(page_no: int, size: int, keyword: Optional[str], status=None) -> dict:
+_DEAD_FILTERS = {"alive", "all", "dead"}
+_DEAD_SORTS = {"none": None, "first": True, "last": False}
+
+
+async def list_accounts(
+    page_no: int, size: int, keyword: Optional[str], status=None,
+    dead_filter: str = "alive", dead_sort: str = "none",
+) -> dict:
     # keyword/status 容错:空串、纯空白、非法数字一律视为"不过滤"(None),避免前端
     # 清空筛选传空串时报错或误过滤掉全部号。
     kw = keyword.strip() if isinstance(keyword, str) else keyword
     if not kw:
         kw = None
     status_val = _parse_status(status)
-    records, total = await run_db(account_repo.page, page_no, size, kw, status_val)
+
+    # 死号筛选/排序容错:非法值落回默认,确保前端传任何垃圾值都不 500
+    df = dead_filter if dead_filter in _DEAD_FILTERS else "alive"
+    ds = _DEAD_SORTS.get(dead_sort, None)
+
+    records, total = await run_db(account_repo.page, page_no, size, kw, status_val, df, ds)
     return {"page": page_no, "size": size, "total": total, "records": [_to_vo(a) for a in records]}
 
 
@@ -76,6 +92,72 @@ def _parse_status(status) -> Optional[int]:
         return int(text)
     except ValueError:
         return None
+
+
+# ---------- 死号 / 发送日志 ----------
+def _to_dead_vo(acc) -> dict:
+    return {
+        "phone": acc.phone,
+        "tgFirstName": acc.tg_first_name,
+        "tgLastName": acc.tg_last_name,
+        "tgUsername": acc.tg_username,
+        "deadReason": acc.dead_reason,
+        "deadTime": acc.dead_time.strftime("%Y-%m-%d %H:%M:%S") if acc.dead_time else None,
+        "loginTime": acc.login_time.strftime("%Y-%m-%d %H:%M:%S") if acc.login_time else None,
+        "createTime": acc.create_time.strftime("%Y-%m-%d %H:%M:%S") if acc.create_time else None,
+    }
+
+
+def _to_send_log_vo(row: dict) -> dict:
+    """发送日志单行转 VO。err_message 是完整 repr(exc),前端按需展示。"""
+    t = row.get("send_time")
+    return {
+        "id": row["id"],
+        "phone": row["phone"],
+        "chatId": row["chat_id"],
+        "source": row["source"],
+        "ok": int(row["ok"]) == 1,
+        "errCode": row.get("err_code"),
+        "errMessage": row.get("err_message"),
+        "contentPreview": row.get("content_preview"),
+        "sendTime": t.strftime("%Y-%m-%d %H:%M:%S") if t else None,
+    }
+
+
+async def list_dead_accounts(page_no: int, size: int, keyword: Optional[str]) -> dict:
+    """死号分页(is_dead=1),按 dead_time 倒序。"""
+    kw = keyword.strip() if isinstance(keyword, str) else keyword
+    if not kw:
+        kw = None
+    records, total = await run_db(account_repo.page_dead, page_no, size, kw)
+    return {
+        "page": page_no, "size": size, "total": total,
+        "records": [_to_dead_vo(a) for a in records],
+    }
+
+
+async def revive_dead(phone: str) -> None:
+    """复活死号:is_dead=0,status=0(待重新走登录流程)。"""
+    phone = _normalize(phone)
+    affected = await run_db(account_repo.revive, phone)
+    if not affected:
+        raise AccountError("该号不在死号列表(可能已被复活或删除)", code=404)
+    logger.info("[死号] 已复活 phone=%s", phone)
+
+
+async def list_send_logs(
+    phone: str, page_no: int, size: int,
+    only_failed: bool = False, hours: Optional[int] = None,
+) -> dict:
+    """单号发送日志分页。"""
+    phone = _normalize(phone)
+    rows, total = await run_db(
+        send_log_repo.page_by_phone, phone, page_no, size, only_failed, hours,
+    )
+    return {
+        "page": page_no, "size": size, "total": total,
+        "records": [_to_send_log_vo(r) for r in rows],
+    }
 
 
 async def list_groups(phone: str, page_no: int, size: int) -> dict:
@@ -295,6 +377,7 @@ def _cascade_delete(phone: str) -> None:
             cur.execute("DELETE FROM t_keyword_reply WHERE phone=%s", (phone,))
             cur.execute("DELETE FROM t_ai_topic_member WHERE phone=%s", (phone,))
             cur.execute("DELETE FROM t_account_watch WHERE phone=%s", (phone,))
+            cur.execute("DELETE FROM t_send_log WHERE phone=%s", (phone,))
             cur.execute("DELETE FROM t_account WHERE phone=%s", (phone,))
 
 

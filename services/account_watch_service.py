@@ -62,15 +62,16 @@ async def _check_one(phone: str) -> None:
             await run_db(account_repo.update_status, phone, int(AccountStatus.OFFLINE))
             return
 
-    # 授权校验:失效则判为需重新登录(死号),移出池
+    # 授权校验:失效则判为死号(不可恢复异常),移出池并搬到死号列表
     try:
         authorized = await client.is_user_authorized()
     except _DEAD_ERRORS as exc:
-        logger.warning("巡检发现 session 已失效(被作废/封禁),需重新登录 phone=%s", phone, exc_info=exc)
-        await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+        logger.warning("巡检发现 session 已失效(被作废/封禁),标记死号 phone=%s", phone, exc_info=exc)
+        await run_db(account_repo.mark_dead, phone, type(exc).__name__, str(exc))
         await client_manager.remove(phone)
         return
     if not authorized:
+        # 未授权但没抛具体死号异常:仍按需重登处理,不进死号列表(运营走重登可恢复)
         logger.warning("巡检发现未授权,需重新登录 phone=%s", phone)
         await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
         await client_manager.remove(phone)
@@ -85,8 +86,8 @@ async def _sync_profile(phone: str, client) -> None:
     try:
         me = await client.get_me()
     except _DEAD_ERRORS as exc:
-        logger.warning("拉取资料发现 session 已失效,需重新登录 phone=%s", phone, exc_info=exc)
-        await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+        logger.warning("拉取资料发现 session 已失效,标记死号 phone=%s", phone, exc_info=exc)
+        await run_db(account_repo.mark_dead, phone, type(exc).__name__, str(exc))
         await client_manager.remove(phone)
         return
     if me is None:

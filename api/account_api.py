@@ -21,11 +21,14 @@ router = APIRouter(prefix="/account", tags=["account"])
 @router.get("/list")
 async def list_accounts(
     page: int = 1, size: int = 10, keyword: str | None = None, status: str | None = None,
+    deadFilter: str = "alive", deadSort: str = "none",
     _: CurrentUser = Depends(get_current_user),
 ) -> dict:
     # status 收字符串而非 int:前端清空筛选后可能传空串 ?status=,用 int 类型会触发
     # 422 校验失败致列表整页空白。统一在 service 层把空串/非法值当作"不过滤"。
-    data = await account_service.list_accounts(page, size, keyword, status)
+    # deadFilter: alive(默认,只看正常号) / all(全部) / dead(只看死号)
+    # deadSort:   none(默认,login_time DESC) / first(死号靠前) / last(死号靠后)
+    data = await account_service.list_accounts(page, size, keyword, status, deadFilter, deadSort)
     return result(data)
 
 
@@ -131,6 +134,42 @@ async def import_result(batch_id: str, _: CurrentUser = Depends(get_current_user
     data = batch_store.get(batch_id)
     if data is None:
         raise BizError("批次不存在或已过期", code=404)
+    return result(data)
+
+
+# ---------- 死号 / 发送日志 ----------
+# 注意:静态前缀路由必须放在 `/{phone}`、`DELETE /{phone}` 这种 catch-all 之前,
+# 否则会被前者拦截。
+@router.get("/dead-list")
+async def list_dead_accounts(
+    page: int = 1, size: int = 20, keyword: str | None = None,
+    _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """死号列表分页。"""
+    data = await account_service.list_dead_accounts(page, size, keyword)
+    return result(data)
+
+
+@router.post("/{phone}/revive")
+async def revive_account(
+    phone: str, _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """复活死号(搬回主列表,待重新登录恢复使用)。"""
+    try:
+        await account_service.revive_dead(phone)
+    except AccountError as exc:
+        raise BizError(exc.message, code=exc.code) from exc
+    return result()
+
+
+@router.get("/{phone}/send-logs")
+async def list_send_logs(
+    phone: str, page: int = 1, size: int = 20,
+    onlyFailed: bool = False, hours: int | None = None,
+    _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """单号发送日志分页。onlyFailed 只看失败,hours 最近 N 小时。"""
+    data = await account_service.list_send_logs(phone, page, size, onlyFailed, hours)
     return result(data)
 
 

@@ -34,23 +34,42 @@ def find_by_status(status: int) -> List[Account]:
 
 
 def find_by_statuses(statuses: List[int]) -> List[Account]:
-    """按多个状态查询(启动全起用:已登录 + 需重新登录都试连)。"""
+    """按多个状态查询(启动全起用:已登录 + 需重新登录都试连)。死号不参与启动。"""
     if not statuses:
         return []
     placeholders = ",".join(["%s"] * len(statuses))
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT * FROM t_account WHERE status IN ({placeholders})", tuple(statuses))
+            cur.execute(
+                f"SELECT * FROM t_account WHERE status IN ({placeholders}) AND is_dead = 0",
+                tuple(statuses),
+            )
             rows = cur.fetchall()
     return [Account.from_row(r) for r in rows]
 
 
 def page(
-    page_no: int, size: int, keyword: Optional[str], status: Optional[int]
+    page_no: int, size: int, keyword: Optional[str], status: Optional[int],
+    dead_filter: str = "alive", dead_sort_first: Optional[bool] = None,
 ) -> Tuple[List[Account], int]:
-    """分页 + 搜索(电话/用户名模糊、状态精确)。返回 (记录, 总数)。"""
+    """分页 + 搜索(电话/用户名模糊、状态精确)。返回 (记录, 总数)。
+
+    dead_filter:
+      - "alive"(默认): 只看正常号 (is_dead=0),用于死号物理隔离场景
+      - "all": 全部,死号也看得到 (主列表加了死号过滤下拉后用)
+      - "dead": 只看死号 (is_dead=1)
+    dead_sort_first:
+      - None: 不按 is_dead 排序,沿用 login_time DESC, id DESC (默认)
+      - True: 死号靠前 → is_dead DESC + dead_time DESC + login_time DESC + id DESC
+      - False: 死号靠后 → is_dead ASC + login_time DESC + id DESC
+    """
     where: list[str] = []
     params: list = []
+    if dead_filter == "alive":
+        where.append("is_dead = 0")
+    elif dead_filter == "dead":
+        where.append("is_dead = 1")
+    # "all" 不加过滤
     if keyword:
         where.append("(phone LIKE %s OR tg_username LIKE %s OR tg_first_name LIKE %s)")
         like = f"%{keyword}%"
@@ -59,6 +78,13 @@ def page(
         where.append("status = %s")
         params.append(status)
     clause = f" WHERE {' AND '.join(where)}" if where else ""
+
+    if dead_sort_first is True:
+        order_by = "is_dead DESC, dead_time DESC, login_time DESC, id DESC"
+    elif dead_sort_first is False:
+        order_by = "is_dead ASC, login_time DESC, id DESC"
+    else:
+        order_by = "login_time DESC, id DESC"
 
     if page_no < 1:
         page_no = 1
@@ -69,11 +95,71 @@ def page(
             cur.execute(f"SELECT COUNT(*) AS cnt FROM t_account{clause}", tuple(params))
             total = int(cur.fetchone()["cnt"])
             cur.execute(
-                f"SELECT * FROM t_account{clause} ORDER BY login_time DESC, id DESC LIMIT %s OFFSET %s",
+                f"SELECT * FROM t_account{clause} ORDER BY {order_by} LIMIT %s OFFSET %s",
                 tuple(params + [size, offset]),
             )
             rows = cur.fetchall()
     return [Account.from_row(r) for r in rows], total
+
+
+def page_dead(
+    page_no: int, size: int, keyword: Optional[str],
+) -> Tuple[List[Account], int]:
+    """死号分页(is_dead=1)。按 dead_time 倒序。"""
+    where = ["is_dead = 1"]
+    params: list = []
+    if keyword:
+        where.append("(phone LIKE %s OR tg_username LIKE %s OR tg_first_name LIKE %s OR dead_reason LIKE %s)")
+        like = f"%{keyword}%"
+        params += [like, like, like, like]
+    clause = " WHERE " + " AND ".join(where)
+
+    if page_no < 1:
+        page_no = 1
+    offset = (page_no - 1) * size
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) AS cnt FROM t_account{clause}", tuple(params))
+            total = int(cur.fetchone()["cnt"])
+            cur.execute(
+                f"SELECT * FROM t_account{clause} ORDER BY dead_time DESC, id DESC LIMIT %s OFFSET %s",
+                tuple(params + [size, offset]),
+            )
+            rows = cur.fetchall()
+    return [Account.from_row(r) for r in rows], total
+
+
+def mark_dead(phone: str, err_code: str, err_desc: str) -> int:
+    """打死号标。err_code+desc 拼成 dead_reason 存。
+
+    WHERE is_dead=0 保证只标第一次,后续重复触发的更新返回 0 行(口径口径稳定,
+    不覆盖原始失效原因)。同时 status=5,与现有「需重登」语义一致。
+    返回受影响行数,>0 说明本次确实把号搬到了死号集合。
+    """
+    reason = f"{err_code}: {err_desc}"[:255]  # VARCHAR(255) 截断
+    now = datetime.now()
+    sql = (
+        "UPDATE t_account SET is_dead=1, dead_reason=%s, dead_time=%s, "
+        "status=5, update_time=%s WHERE phone=%s AND is_dead=0"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (reason, now, now, phone))
+            return int(cur.rowcount)
+
+
+def revive(phone: str) -> int:
+    """复活死号:is_dead=0,status=0(未登录,运营走重新登录),清空死号字段。"""
+    now = datetime.now()
+    sql = (
+        "UPDATE t_account SET is_dead=0, dead_reason=NULL, dead_time=NULL, "
+        "status=0, update_time=%s WHERE phone=%s AND is_dead=1"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (now, phone))
+            return int(cur.rowcount)
 
 
 def upsert_protocol(

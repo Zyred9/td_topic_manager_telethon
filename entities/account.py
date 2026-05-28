@@ -28,6 +28,9 @@ class Account:
     status: int
     login_time: Optional[datetime]
     persona_json: Optional[str]
+    is_dead: int                  # 0 正常,1 已失效(死号)
+    dead_reason: Optional[str]    # 失效原因
+    dead_time: Optional[datetime]
     create_time: Optional[datetime]
     update_time: Optional[datetime]
 
@@ -53,6 +56,9 @@ class Account:
             status=int(row["status"]),
             login_time=row.get("login_time"),
             persona_json=row.get("persona_json"),
+            is_dead=int(row.get("is_dead") or 0),
+            dead_reason=row.get("dead_reason"),
+            dead_time=row.get("dead_time"),
             create_time=row.get("create_time"),
             update_time=row.get("update_time"),
         )

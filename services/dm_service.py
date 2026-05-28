@@ -27,7 +27,11 @@ def _normalize(phone: str) -> str:
 
 
 def _classify(message) -> str:
-    """判断消息类型。"""
+    """判断消息类型。
+
+    文本判定不能再依赖 message.message —— Telethon 的 custom.Message 上该字段
+    多场景为空,会把真文本误判成 other。改用 raw_text(纯文本)兜底判定。
+    """
     if getattr(message, "sticker", None) is not None:
         return "sticker"
     if getattr(message, "photo", None) is not None:
@@ -38,7 +42,7 @@ def _classify(message) -> str:
         return "voice"
     if getattr(message, "document", None) is not None or getattr(message, "file", None) is not None:
         return "file"
-    if getattr(message, "message", None):
+    if (getattr(message, "raw_text", None) or "").strip():
         return "text"
     return "other"
 
@@ -66,7 +70,10 @@ async def on_message(phone: str, event) -> None:
         msg_time = now
 
     msg_type = _classify(message)
-    text = getattr(message, "message", None) or None  # 文本或媒体 caption
+    # 文本/caption 一律走 raw_text(纯文本,媒体消息的 caption 也走这里)。
+    # 早期版本用 message.message,但 Telethon 的 custom.Message 上该字段
+    # 在多种消息类型下返回空,会导致前端看到"内容空白"。
+    text = (getattr(event, "raw_text", None) or "").strip() or None
     media_path: Optional[str] = None
     media_size: Optional[int] = None
     media_note: Optional[str] = None

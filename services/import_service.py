@@ -1,14 +1,22 @@
 """协议号 zip 导入。
 
-zip 结构(每号一目录):
-  +<phone>/
-    +<phone>.session   ← Telethon SQLite session,原生可连
-    +<phone>.json      ← 自带 app_id/app_hash/device/app_version/lang/twoFA
-    2fa.txt            ← 二级密码(= json.twoFA)
-    tdata/             ← TDLib 残留,忽略
+支持两种 zip 布局,扫描前统一归一为「每号一目录」:
 
-流程:存 zip → 异步解压扫描 → 每号提取 .session + .json → 复制 session 到 sessions/ →
-upsert(import_type=2,存自带凭证)→ 用自带凭证 connect 校验授权 →
+布局 A(扁平,文件名=手机号):
+  <root>/
+    <phone>.session   <phone>.json      ← 多号并列,无子目录
+    ...
+  (json 字段同布局 B,session_file 可带或不带 + 前缀)
+
+布局 B(每号一子目录):
+  +<phone>/
+    +<phone>.session  ← Telethon SQLite session,原生可连
+    +<phone>.json     ← 自带 app_id/app_hash/device/app_version/lang/twoFA
+    2fa.txt           ← 二级密码(= json.twoFA)
+    tdata/            ← TDLib 残留,忽略
+
+流程:存 zip → 异步解压 → 归一化布局 → 扫号目录 → 每号提取 .session + .json →
+复制 session 到 sessions/ → upsert(import_type=2,存自带凭证)→ 用自带凭证 connect 校验授权 →
 授权 OK status=3;需 2FA 且有 two_fa 自动补;否则 status=2/6。进度写 batch_store。
 """
 
@@ -46,6 +54,47 @@ def save_upload(file_bytes: bytes) -> Path:
     return path
 
 
+_PHONE_FROM_NAME_RE = re.compile(r"^\+?(\d{8,15})$")
+
+
+def _normalize_flat_layout(extract_root: Path) -> None:
+    """把扁平布局(<phone>.session 直接躺在根目录)归一为「每号一目录」。
+
+    规则:扫根目录下的 *.session 文件,文件主名若是 8~15 位数字(允许 + 前缀),
+    则把同主名的所有兄弟文件(.session/.json/2fa.txt 等)移进 `+<phone>/` 子目录。
+    已是子目录布局时本函数为 no-op。
+    """
+    if not extract_root.is_dir():
+        return
+    # 先收集需要搬运的「主名 → phone」映射,避免边遍历边改
+    plans: dict[str, str] = {}
+    for child in extract_root.iterdir():
+        if not child.is_file():
+            continue
+        if child.suffix.lower() != ".session":
+            continue
+        stem = child.stem
+        m = _PHONE_FROM_NAME_RE.match(stem)
+        if not m:
+            continue
+        plans[stem] = f"+{m.group(1)}"
+
+    for stem, phone in plans.items():
+        target_dir = extract_root / phone
+        target_dir.mkdir(exist_ok=True)
+        # 同主名的全部文件都搬过去(.session / .json / 任何后缀),
+        # 同主名+_2fa.txt 之类副产物也一并带走;不动其他号或目录。
+        for sibling in extract_root.iterdir():
+            if not sibling.is_file():
+                continue
+            if sibling.stem != stem and not sibling.name.startswith(f"{stem}."):
+                continue
+            try:
+                sibling.rename(target_dir / sibling.name)
+            except OSError as exc:
+                logger.warning("[导入] 归一化布局移动失败 src=%s err=%s", sibling, exc)
+
+
 def scan_phone_dirs(extract_root: Path) -> list[tuple[str, Path]]:
     """扫描解压根下的号目录,返回 [(规范化phone, 目录)]。"""
     found: list[tuple[str, Path]] = []
@@ -63,9 +112,10 @@ def scan_phone_dirs(extract_root: Path) -> list[tuple[str, Path]]:
 
 
 def count_phone_dirs(zip_path: Path, extract_root: Path) -> int:
-    """先解压并统计号目录数(用于 batch total)。"""
+    """先解压并统计号目录数(用于 batch total)。两种布局都支持。"""
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(extract_root)
+    _normalize_flat_layout(extract_root)
     return len(scan_phone_dirs(extract_root))
 
 

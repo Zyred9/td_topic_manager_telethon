@@ -30,18 +30,29 @@ logger = logging.getLogger(__name__)
 
 # ---------- 消息上下文缓存 ----------
 class MessageCache:
-    """按 chat_id 分桶缓存最近消息(普通群,一群一话题)。"""
+    """按 chat_id 分桶缓存最近消息(普通群,一群一话题)。
+
+    每条带 is_bot 标记:小号自驱/应答产出的句子标 True;真人发言标 False。
+    生成回复时只把真人发言喂给 LLM,避免「小号互相抄越抄越短」的自我循环
+    (历史问题:全量喂回时 LLM 看到一串 "嗯/哈哈/对" 也跟着输出 2-3 字短句)。
+    """
 
     def __init__(self, window: int = CONTEXT_WINDOW) -> None:
         self._window = window
-        self._data: Dict[int, Deque[str]] = defaultdict(lambda: deque(maxlen=window))
+        # 每条 = (is_bot, formatted_line)
+        self._data: Dict[int, Deque[tuple[bool, str]]] = defaultdict(lambda: deque(maxlen=window))
 
-    def add(self, chat_id: int, sender: str, text: str) -> None:
+    def add(self, chat_id: int, sender: str, text: str, is_bot: bool = False) -> None:
         if text:
-            self._data[chat_id].append(f"{sender}: {text}")
+            self._data[chat_id].append((is_bot, f"{sender}: {text}"))
 
     def recent(self, chat_id: int) -> List[str]:
-        return list(self._data.get(chat_id, ()))
+        """全部最近消息(真人+小号),仅供调试/前端展示;**不要**直接喂 LLM。"""
+        return [line for _, line in self._data.get(chat_id, ())]
+
+    def recent_for_llm(self, chat_id: int) -> List[str]:
+        """只取真人发言喂 LLM,避免小号互相喂导致越喂越短的自我循环。"""
+        return [line for is_bot, line in self._data.get(chat_id, ()) if not is_bot]
 
 
 _cache = MessageCache()
@@ -158,7 +169,7 @@ async def _emit_self(topic: dict, speaker: str) -> None:
         text = ai_chat_engine.pick_filler(persona)
     else:
         text = await ai_chat_engine.generate_reply(
-            persona, topic["topic_prompt"], _cache.recent(chat_id),
+            persona, topic["topic_prompt"], _cache.recent_for_llm(chat_id),
             reply_target=None, topic_min=topic["reply_min_chars"], topic_max=topic["reply_max_chars"],
         )
     if not text:
@@ -167,7 +178,8 @@ async def _emit_self(topic: dict, speaker: str) -> None:
     if ok:
         _topic_incr_minute(topic["id"])
         name = persona.get("name") or speaker
-        _cache.add(chat_id, name, text)
+        # is_bot=True: 自驱产物只入缓存做去重 / 调试,不再回喂 LLM
+        _cache.add(chat_id, name, text, is_bot=True)
 
 
 async def _check_owner(topic: dict) -> None:
@@ -211,11 +223,11 @@ async def on_message(phone: str, event) -> None:
     phones = await run_db(topic_member_repo.phones_of_topic, topic["id"])
     member_ids = await _member_user_ids(phones)
 
-    # 小号自己发的:记上下文供后续生成参考,但不应答(避免自答风暴)。
+    # 小号自己发的:标 is_bot=True 入缓存(用于去重/调试),但不喂回 LLM,不应答。
     # 每个在管控小号的 client 都会收到这条;用 out 仅由发送方记录一次,避免重复入缓存。
     if sender_id in member_ids:
         if getattr(event, "out", False):
-            _cache.add(chat_id, _member_name(member_ids, sender_id, event), text)
+            _cache.add(chat_id, _member_name(member_ids, sender_id, event), text, is_bot=True)
         return
 
     # 真人发言:消息级去重(同一条消息会被多个 client 触发)
@@ -223,9 +235,9 @@ async def on_message(phone: str, event) -> None:
     if msg_id is None or not _claim_message(chat_id, msg_id):
         return
 
-    # 记上下文(用真实发送者名)
+    # 记上下文(用真实发送者名),真人发言会被喂回 LLM
     sender_name = getattr(getattr(event, "sender", None), "first_name", None) or "用户"
-    _cache.add(chat_id, sender_name, text)
+    _cache.add(chat_id, sender_name, text, is_bot=False)
 
     # 概率应答
     if random.randint(0, 99) >= topic["reply_user_prob"]:
@@ -242,7 +254,7 @@ async def on_message(phone: str, event) -> None:
 
     persona = await _persona_of(responder)
     reply = await ai_chat_engine.generate_reply(
-        persona, topic["topic_prompt"], _cache.recent(chat_id),
+        persona, topic["topic_prompt"], _cache.recent_for_llm(chat_id),
         reply_target=text, topic_min=topic["reply_min_chars"], topic_max=topic["reply_max_chars"],
     )
     if not reply:
@@ -252,7 +264,8 @@ async def on_message(phone: str, event) -> None:
     )
     if ok:
         _topic_incr_minute(topic["id"])
-        _cache.add(chat_id, persona.get("name") or responder, reply)
+        # 应答产物也是 bot 发言,标 is_bot=True
+        _cache.add(chat_id, persona.get("name") or responder, reply, is_bot=True)
 
 
 async def _find_running_topic(chat_id: int) -> Optional[dict]:

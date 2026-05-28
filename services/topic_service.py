@@ -64,10 +64,14 @@ class _EditCreatorRequest(TLRequest):
 
 # 创建话题时可由前端覆盖的字段默认值。message_thread_id 自 aca8422
 # 移除 Forum 子话题逻辑后恒为 0,DB 列保留但不再走 req 取值。
+#
+# 2026-05-28 热聊档调整:之前 30~180s + 每分钟 6 条会显著冷场,
+# 改为 10~45s + 每分钟 12 条,reply 字数下限从 8 提到 10 提高单条信息量。
+# 已有话题不会被自动改写,运营在「话题编辑」里手动改才生效。
 _DEFAULTS = {
-    "speak_min_sec": 30, "speak_max_sec": 180,
-    "reply_user_prob": 30, "max_per_min": 6, "reply_min_chars": 8,
-    "reply_max_chars": 25, "filler_enabled": 1, "filler_prob": 10,
+    "speak_min_sec": 10, "speak_max_sec": 45,
+    "reply_user_prob": 30, "max_per_min": 12, "reply_min_chars": 10,
+    "reply_max_chars": 30, "filler_enabled": 1, "filler_prob": 10,
 }
 
 

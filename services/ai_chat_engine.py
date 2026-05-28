@@ -102,7 +102,12 @@ def render_persona(persona: dict) -> str:
     return ";".join(parts) if parts else "一个普通的群成员"
 
 
-def _target_len(persona: dict, topic_min: int, topic_max: int) -> int:
+def _target_len(persona: dict, topic_min: int, topic_max: int) -> tuple[int, int]:
+    """返回 (lo, target):lo 为最少汉字数,target 为本次目标。
+
+    历史上只返回 target 让 prompt 写 "≤N",LLM 倾向输出 2-3 字短句;现给出下限
+    让 prompt 同时约束最少多少字,避免敷衍式短回复。
+    """
     rng = persona.get("replyLenRange")
     if rng and len(rng) == 2:
         lo, hi = int(rng[0]), int(rng[1])
@@ -110,10 +115,11 @@ def _target_len(persona: dict, topic_min: int, topic_max: int) -> int:
         lo, hi = topic_min, topic_max
     lo = max(1, min(lo, MAX_HAN_CHARS))
     hi = max(lo, min(hi, MAX_HAN_CHARS))
-    return random.randint(lo, hi)
+    target = random.randint(lo, hi)
+    return lo, target
 
 
-def _build_system_prompt(persona: dict, scene: str, target_n: int) -> str:
+def _build_system_prompt(persona: dict, scene: str, lo: int, target_n: int) -> str:
     return (
         "你是一个真实的 Telegram 群用户,正在和其他人聊天。\n"
         f"【你的人设】{render_persona(persona)}\n"
@@ -122,8 +128,9 @@ def _build_system_prompt(persona: dict, scene: str, target_n: int) -> str:
         "- 口语化、自然,像真人随口说话\n"
         "- 不要暴露 AI 身份,不要用「作为一个 AI」之类措辞\n"
         "- 不要复读别人的话,不要客套\n"
-        f"- 本次回复目标 ≤ {target_n} 个汉字(emoji/英文/标点不计),自然控制长度,不要硬凑也不要解释字数\n"
-        "- 只输出聊天内容本身,不要加引号、不要加前缀"
+        f"- 字数:不少于 {lo} 个汉字,目标 {target_n} 个汉字左右(emoji/英文/标点不计)\n"
+        "- 禁止只回 2-3 个字的敷衍短句(如「嗯」「哈哈」「对啊」),要说完整一句话,带具体内容、看法或细节\n"
+        "- 只输出聊天内容本身,不要加引号、不要加前缀,不要解释字数"
     )
 
 
@@ -174,8 +181,8 @@ async def generate_reply(
     topic_max: int,
 ) -> str:
     """生成一条回复。context_msgs 为最近消息("发送者: 内容"),reply_target 为要回应的真人发言。"""
-    target_n = _target_len(persona, topic_min, topic_max)
-    system = _build_system_prompt(persona, scene, target_n)
+    lo, target_n = _target_len(persona, topic_min, topic_max)
+    system = _build_system_prompt(persona, scene, lo, target_n)
     messages = [{"role": "system", "content": system}]
     for c in context_msgs:
         messages.append({"role": "user", "content": c})

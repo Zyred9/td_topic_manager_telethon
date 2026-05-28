@@ -17,6 +17,7 @@ from core.client_manager import client_manager
 from helpers import td_error
 from infra.db import run_db
 from repositories import account_watch_repo, topic_member_repo, topic_repo
+from services import ai_chat_engine
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +66,13 @@ class _EditCreatorRequest(TLRequest):
 # 创建话题时可由前端覆盖的字段默认值。message_thread_id 自 aca8422
 # 移除 Forum 子话题逻辑后恒为 0,DB 列保留但不再走 req 取值。
 #
-# 2026-05-28 热聊档调整:之前 30~180s + 每分钟 6 条会显著冷场,
-# 改为 10~45s + 每分钟 12 条,reply 字数下限从 8 提到 10 提高单条信息量。
-# 已有话题不会被自动改写,运营在「话题编辑」里手动改才生效。
+# 2026-05-28 调优: 之前 10~45s + 每分钟 12 条 + filler_prob 10 仍偏密,
+# 改为 30~90s + 每分钟 10 条, 配合 FILLER_POOL 自然化减少刷屏感。
+# 已有话题不会被自动改写, 运营在「话题编辑」里手动改才生效。
 _DEFAULTS = {
-    "speak_min_sec": 10, "speak_max_sec": 45,
-    "reply_user_prob": 30, "max_per_min": 12, "reply_min_chars": 10,
-    "reply_max_chars": 30, "filler_enabled": 1, "filler_prob": 10,
+    "speak_min_sec": 30, "speak_max_sec": 90,
+    "reply_user_prob": 30, "max_per_min": 10, "reply_min_chars": 15,
+    "reply_max_chars": 40, "filler_enabled": 1, "filler_prob": 15,
 }
 
 
@@ -153,8 +154,19 @@ async def create_topic(req) -> dict:
     for p in members:
         await run_db(account_watch_repo.add, p, chat_id)
 
+    # topic_prompt 留空 → 调 LLM 按话题名自动生成完整场景;失败抛业务异常给前端
+    topic_prompt = (req.topicPrompt or "").strip()
+    if not topic_prompt:
+        if not req.topicName or not req.topicName.strip():
+            raise TopicError("话题名不能为空")
+        try:
+            topic_prompt = await ai_chat_engine.generate_topic_prompt(req.topicName)
+            logger.info("自动生成场景 topic_name=%s len=%d", req.topicName, len(topic_prompt))
+        except Exception as exc:
+            raise TopicError(f"自动生成场景失败,请手填或重试: {exc}") from exc
+
     data = {
-        "topic_name": req.topicName, "topic_prompt": req.topicPrompt,
+        "topic_name": req.topicName, "topic_prompt": topic_prompt,
         "owner_phone": owner_phone, "chat_id": chat_id, "message_thread_id": 0,
         "speak_min_sec": cfg["speak_min_sec"], "speak_max_sec": cfg["speak_max_sec"],
         "reply_user_prob": cfg["reply_user_prob"], "max_per_min": cfg["max_per_min"],

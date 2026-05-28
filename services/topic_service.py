@@ -62,8 +62,10 @@ class _EditCreatorRequest(TLRequest):
         return cls(channel=_channel, user_id=_user_id, password=_password)
 
 
+# 创建话题时可由前端覆盖的字段默认值。message_thread_id 自 aca8422
+# 移除 Forum 子话题逻辑后恒为 0,DB 列保留但不再走 req 取值。
 _DEFAULTS = {
-    "message_thread_id": 0, "speak_min_sec": 30, "speak_max_sec": 180,
+    "speak_min_sec": 30, "speak_max_sec": 180,
     "reply_user_prob": 30, "max_per_min": 6, "reply_min_chars": 8,
     "reply_max_chars": 25, "filler_enabled": 1, "filler_prob": 10,
 }
@@ -176,7 +178,6 @@ async def update_topic(topic_id: int, req) -> dict:
         "replyUserProb": "reply_user_prob", "maxPerMin": "max_per_min",
         "replyMinChars": "reply_min_chars", "replyMaxChars": "reply_max_chars",
         "fillerEnabled": "filler_enabled", "fillerProb": "filler_prob",
-        "messageThreadId": "message_thread_id",
     }
     for camel, col in mapping.items():
         val = getattr(req, camel, None)

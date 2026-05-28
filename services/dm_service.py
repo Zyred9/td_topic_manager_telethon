@@ -188,6 +188,7 @@ async def list_messages(phone: str, peer_user_id: int, page_no: int, size: int) 
             "tgMsgId": r["tg_msg_id"],
             "msgType": r["msg_type"],
             "content": r["content"],
+            "text": r["content"],
             # 前端经 /api/static/media/<path> 预览(Nginx/StaticFiles 服务)
             "mediaUrl": f"static/media/{r['media_path']}" if r.get("media_path") else None,
             "mediaSize": r["media_size"],

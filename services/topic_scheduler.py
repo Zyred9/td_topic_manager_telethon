@@ -39,16 +39,21 @@ class MessageCache:
     每条带 is_bot 标记:小号自驱/应答产出的句子标 True;真人发言标 False。
     recent_for_llm 把真人 + 长度 >= 5 字的小号发言一起喂回,让 LLM 能接住上下文;
     短小号发言(嗯/哈哈/+1) 不喂,防止「LLM 看到一串短句 → 自己也输出短句」的自激。
+    random_reply_target 从最近消息中随机抽一条 msg_id,供自驱引用回复。
     """
 
     def __init__(self, window: int = CONTEXT_WINDOW) -> None:
         self._window = window
         # 每条 = (is_bot, formatted_line, han_count) — 预存 han 数,recent_for_llm 不重算
         self._data: Dict[int, Deque[tuple[bool, str, int]]] = defaultdict(lambda: deque(maxlen=window))
+        # msg_id 独立队列,用于自驱引用回复;长度与 _data 对齐
+        self._msg_ids: Dict[int, Deque[int]] = defaultdict(lambda: deque(maxlen=window))
 
-    def add(self, chat_id: int, sender: str, text: str, is_bot: bool = False) -> None:
+    def add(self, chat_id: int, sender: str, text: str, is_bot: bool = False, msg_id: Optional[int] = None) -> None:
         if text:
             self._data[chat_id].append((is_bot, f"{sender}: {text}", count_han(text)))
+            if msg_id is not None:
+                self._msg_ids[chat_id].append(msg_id)
 
     def recent(self, chat_id: int) -> List[str]:
         """全部最近消息(真人+小号),仅供调试/前端展示;**不要**直接喂 LLM。"""
@@ -60,6 +65,11 @@ class MessageCache:
             line for is_bot, line, han in self._data.get(chat_id, ())
             if (not is_bot) or han >= _LLM_FEED_MIN_HAN
         ]
+
+    def random_reply_target(self, chat_id: int) -> Optional[int]:
+        """随机选一条最近消息 ID 作为自驱引用回复的目标。"""
+        ids = list(self._msg_ids.get(chat_id, ()))
+        return random.choice(ids) if ids else None
 
 
 _cache = MessageCache()
@@ -244,7 +254,9 @@ async def _emit_self(topic: dict, speaker: str) -> None:
         logger.debug("[话题] LLM phone=%s topic_id=%s len=%d", speaker, topic["id"], len(text))
     if not text:
         return
-    ok, _ = await message_sender.send_text(speaker, chat_id, text, source=SendSource.AI_SELF)
+    # 自驱 LLM 路径 15% 概率随机引用一条最近消息,模拟真人接话的回复感
+    reply_to = _cache.random_reply_target(chat_id) if random.random() < 0.15 else None
+    ok, _ = await message_sender.send_text(speaker, chat_id, text, reply_to=reply_to, source=SendSource.AI_SELF)
     if ok:
         _topic_incr_minute(topic["id"])
         # P3 记录发言者(主聊者加权用)+ 群级近期发言数(冷却用)
@@ -299,7 +311,8 @@ async def on_message(phone: str, event) -> None:
     # 每个在管控小号的 client 都会收到这条;用 out 仅由发送方记录一次,避免重复入缓存。
     if sender_id in member_ids:
         if getattr(event, "out", False):
-            _cache.add(chat_id, _member_name(member_ids, sender_id, event), text, is_bot=True)
+            _cache.add(chat_id, _member_name(member_ids, sender_id, event), text,
+                       is_bot=True, msg_id=getattr(event.message, "id", None))
         return
 
     # 真人发言:消息级去重(同一条消息会被多个 client 触发)
@@ -309,7 +322,7 @@ async def on_message(phone: str, event) -> None:
 
     # 记上下文(用真实发送者名),真人发言会被喂回 LLM
     sender_name = getattr(getattr(event, "sender", None), "first_name", None) or "用户"
-    _cache.add(chat_id, sender_name, text, is_bot=False)
+    _cache.add(chat_id, sender_name, text, is_bot=False, msg_id=msg_id)
 
     # 概率应答
     if random.randint(0, 99) >= topic["reply_user_prob"]:

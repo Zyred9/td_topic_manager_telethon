@@ -159,15 +159,14 @@ def _build_system_prompt(
     else:
         length_rule = f"这次说得稍微完整些,{lo}-{target_n} 字左右,带具体内容或看法"
     drift_rule = (
-        "如果你刚好想到别的事(吃的、天气、最近遇到的、突然冒出来的念头),可以临时岔开聊,不必每句都扣题。"
+        " 如果你刚好想到别的事(吃的、天气、最近遇到的、突然冒出来的念头),可以临时岔开聊,不必每句都扣题。"
         if allow_drift else ""
     )
     return (
         f"{persona_text}{mood_line}\n"
-        f"群里现在在聊: {scene}\n"
-        "看上面的聊天记录,自然接上一句话。不要客套、不要复读、不要解释自己是谁。"
-        f"{length_rule}。{drift_rule}"
-        "直接说,不加引号不加前缀。"
+        f"当前群聊: {scene}\n"
+        f"用你的语气接着聊,就像平时聊天那样。{drift_rule}{length_rule}。"
+        "不用点名(如「老王」「兄弟」),不用客套。直接说,不加引号不解释。"
     )
 
 

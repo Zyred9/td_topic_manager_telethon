@@ -19,6 +19,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 load_dotenv(BASE_DIR / ".env")
 
+# 服务前缀:多服务部署时,敏感配置走 TDTM_ 开头的系统环境变量避免冲突。
+# 详见 _get_prefixed,只对 8 个敏感项启用,其它沿用旧 key。
+_ENV_PREFIX = "TDTM_"
+
 
 def _get(key: str, default: str = "") -> str:
     value = os.getenv(key)
@@ -28,6 +32,21 @@ def _get(key: str, default: str = "") -> str:
 def _get_int(key: str, default: int) -> int:
     try:
         return int(_get(key, str(default)))
+    except ValueError:
+        return default
+
+
+def _get_prefixed(key: str, default: str = "") -> str:
+    """敏感配置:优先读 TDTM_<KEY> 防多服务串扰,回退 <KEY> 兼容旧部署。"""
+    value = os.getenv(_ENV_PREFIX + key)
+    if value is not None and value != "":
+        return value
+    return _get(key, default)
+
+
+def _get_prefixed_int(key: str, default: int) -> int:
+    try:
+        return int(_get_prefixed(key, str(default)))
     except ValueError:
         return default
 
@@ -149,34 +168,34 @@ def get_settings() -> Settings:
     return Settings(
         server=ServerConfig(
             host=_get("SERVER_HOST", "0.0.0.0"),
-            port=_get_int("SERVER_PORT", 8813),
+            port=_get_prefixed_int("SERVER_PORT", 8813),
             root_path=_get("ROOT_PATH", "/collect"),
         ),
         db=DbConfig(
             host=_get("DB_HOST", "127.0.0.1"),
             port=_get_int("DB_PORT", 3306),
-            user=_get("DB_USER", "root"),
-            password=_get("DB_PASSWORD", ""),
+            user=_get_prefixed("DB_USER", "root"),
+            password=_get_prefixed("DB_PASSWORD", ""),
             database=_get("DB_NAME", "td_topic_manager"),
         ),
         telegram=TelegramConfig(
-            api_id=_get_int("TG_API_ID", 26446149),
-            api_hash=_get("TG_API_HASH", "923e9061ea87df0e3a79af95338f620d"),
+            api_id=_get_prefixed_int("TG_API_ID", 0),
+            api_hash=_get_prefixed("TG_API_HASH", ""),
             device_model=_get("TG_DEVICE_MODEL", "Desktop"),
             app_version=_get("TG_APP_VERSION", "1.0.1"),
             system_lang=_get("TG_SYSTEM_LANG", "zh"),
         ),
         llm=LlmConfig(
             base_url=_get("LLM_BASE_URL", "https://api.deepseek.com/v1"),
-            api_key=_get("LLM_API_KEY", ""),
+            api_key=_get_prefixed("LLM_API_KEY", ""),
             model=_get("LLM_MODEL", "deepseek-chat"),
             timeout_sec=_get_int("LLM_TIMEOUT_SEC", 30),
         ),
         auth=AuthConfig(
-            jwt_secret=_get("JWT_SECRET", "change-me"),
+            jwt_secret=_get_prefixed("JWT_SECRET", "change-me"),
             jwt_expire_min=_get_int("JWT_EXPIRE_MIN", 480),
             init_admin_user=_get("INIT_ADMIN_USER", "admin"),
-            init_admin_password=_get("INIT_ADMIN_PASSWORD", "admin123"),
+            init_admin_password=_get_prefixed("INIT_ADMIN_PASSWORD", "admin123"),
         ),
         risk=RiskConfig(
             min_interval_ms=_get_int("SEND_MIN_INTERVAL_MS", 1500),

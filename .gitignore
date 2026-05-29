@@ -22,3 +22,5 @@ venv/
 
 # 计划/状态(本地)
 .omc/
+.cursor
+.codegraph

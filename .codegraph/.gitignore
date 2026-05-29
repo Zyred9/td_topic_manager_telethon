@@ -14,4 +14,7 @@ cache/
 
 # Hook markers
 .dirty
-codegraph
+.codegraph
+.cursor
+.idea
+.omc

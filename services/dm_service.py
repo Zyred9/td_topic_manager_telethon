@@ -15,6 +15,7 @@ from config.constants import DM_MEDIA_MAX_BYTES
 from config.settings import get_settings
 from core import update_router
 from core.client_manager import client_manager
+from helpers.time_format import to_cn_str
 from infra.db import run_db
 from repositories import dm_repo
 
@@ -171,7 +172,7 @@ async def list_peers(phone: str) -> list:
             "firstName": r["first_name"],
             "lastName": r["last_name"],
             "displayName": _peer_name(r["first_name"], r["last_name"], r["username"], r["peer_user_id"]),
-            "lastMsgTime": r["last_msg_time"].strftime("%Y-%m-%d %H:%M:%S") if r.get("last_msg_time") else None,
+            "lastMsgTime": to_cn_str(r.get("last_msg_time")),
             "msgCount": int(r["msg_count"]),
         }
         for r in rows
@@ -193,7 +194,7 @@ async def list_messages(phone: str, peer_user_id: int, page_no: int, size: int) 
             "mediaUrl": f"static/media/{r['media_path']}" if r.get("media_path") else None,
             "mediaSize": r["media_size"],
             "mediaNote": r["media_note"],
-            "msgTime": r["msg_time"].strftime("%Y-%m-%d %H:%M:%S") if r.get("msg_time") else None,
+            "msgTime": to_cn_str(r.get("msg_time")),
         }
         for r in rows
     ]

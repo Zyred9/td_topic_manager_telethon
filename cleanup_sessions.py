@@ -11,6 +11,9 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
+from dotenv import load_dotenv
+load_dotenv(BASE_DIR / ".env")  # 显式加载,避免工作目录不同导致 .env 读不到
+
 from config.settings import get_settings
 from infra.db import get_connection
 

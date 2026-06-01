@@ -189,9 +189,13 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
     else:
         client = telethon_factory.build_client_for_phone(str(session_dst))
 
-    await client.connect()
+    # connect() 必须纳入 try:Telethon 读 .session(SQLite)时,若 session 是新版
+    # Telethon/第三方工具写的、列数与当前运行版本不一致,会在 connect 阶段抛
+    # ValueError("too many values to unpack (...)"),此前在 try 外裸抛会冒泡到
+    # run_import 的兜底分支,把英文原文当 failReason 泄给前端,且 client 不 disconnect 泄漏。
     registered = False
     try:
+        await client.connect()
         if await client.is_user_authorized():
             me = await client.get_me()
             await client_manager.register_ready_client(phone, client)
@@ -212,6 +216,16 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
         await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
         batch_store.set_item(batch_id, phone, ITEM_FAILED,
                              fail_reason=f"频率限制,请等待 {exc.seconds} 秒后重试")
+    except ValueError as exc:
+        # session 文件格式与当前 Telethon 版本不兼容(典型:too many values to unpack)。
+        # 这是版本不匹配,不是号本身坏:新版工具写的多列 session 喂给旧版 Telethon 读不了。
+        # 给运营能看懂的中文,指向真正的解法(升级 telethon),不再泄英文原文。
+        logger.warning("[导入] %s session 格式与当前 Telethon 不兼容: %s", phone, exc)
+        await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+        batch_store.set_item(
+            batch_id, phone, ITEM_FAILED,
+            fail_reason="session 格式与当前 Telethon 版本不兼容,请升级服务端 telethon 或改手机号登录",
+        )
     except Exception:
         # 任何其它异常(连接错误/RPC 错误)也要标记失败,避免 client 泄漏。
         # 记完整堆栈便于排查,但不向上抛(已写明细),避免上层用英文异常覆盖中文 reason。
@@ -223,6 +237,11 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
         if not registered:
             try:
                 await client.disconnect()
+            except Exception:
+                pass
+            # 导入失败则清理已复制的 session 文件,避免残留垃圾文件影响下次重传
+            try:
+                session_dst.unlink(missing_ok=True)
             except Exception:
                 pass
 

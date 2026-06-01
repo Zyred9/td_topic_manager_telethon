@@ -136,12 +136,8 @@ async def run_import(zip_path: Path, batch_id: str, extract_root: Path) -> None:
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=str(exc))
 
     batch_store.finish(batch_id)
-    # 清理解压临时目录与 zip
+    # 清理解压临时目录,保留原始 zip 供用户重传使用
     shutil.rmtree(extract_root, ignore_errors=True)
-    try:
-        zip_path.unlink(missing_ok=True)
-    except Exception:
-        pass
     logger.info("[导入] batch=%s 完成,共 %d 个号", batch_id, len(dirs))
 
 

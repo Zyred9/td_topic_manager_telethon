@@ -130,26 +130,26 @@ async def send_text(
         except _DEAD_ERRORS as exc2:
             logger.error("[发送] phone=%s chat=%s 退避后死号异常: %s", phone, chat_id, exc2)
             await _log_send(phone, chat_id, source, ok=False,
-                            err_code=type(exc2).__name__, err_message=repr(exc2),
+                            err_code=type(exc2).__name__, err_message=td_error.translate(exc2),
                             content_preview=preview)
             await _mark_dead_and_remove(phone, exc2)
             return False, f"账号已失效({type(exc2).__name__})"
         except Exception as exc2:
             logger.error("[发送] phone=%s chat=%s 退避后仍失败: %s", phone, chat_id, exc2)
             await _log_send(phone, chat_id, source, ok=False,
-                            err_code=type(exc2).__name__, err_message=repr(exc2),
+                            err_code=type(exc2).__name__, err_message=td_error.translate(exc2),
                             content_preview=preview)
             return False, td_error.translate(exc2)
     except _DEAD_ERRORS as exc:
         logger.error("[发送] phone=%s chat=%s 死号异常: %s", phone, chat_id, exc)
         await _log_send(phone, chat_id, source, ok=False,
-                        err_code=type(exc).__name__, err_message=repr(exc),
+                        err_code=type(exc).__name__, err_message=td_error.translate(exc),
                         content_preview=preview)
         await _mark_dead_and_remove(phone, exc)
         return False, f"账号已失效({type(exc).__name__})"
     except Exception as exc:
         logger.error("[发送] phone=%s chat=%s 失败: %s", phone, chat_id, exc)
         await _log_send(phone, chat_id, source, ok=False,
-                        err_code=type(exc).__name__, err_message=repr(exc),
+                        err_code=type(exc).__name__, err_message=td_error.translate(exc),
                         content_preview=preview)
         return False, td_error.translate(exc)

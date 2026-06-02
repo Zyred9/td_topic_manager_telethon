@@ -10,6 +10,20 @@ import re
 
 from telethon import errors
 
+# 异常类名 → 中文。优先级最高:部分异常(如 UserBannedInChannelError)的
+# .message 属性是 BAD_REQUEST 之类的 HTTP 状态,无法靠 _MESSAGE_MAP 匹配,
+# 必须按类名兜住,否则会回退成英文原文或 BAD_REQUEST。
+_CLASS_NAME_MAP: dict[str, str] = {
+    "UserBannedInChannelError": "该小号已被此群封禁,无法在群内发言",
+    "ChatWriteForbiddenError": "无权在该群发言(可能被禁言或群只读)",
+    "ChannelPrivateError": "该群为私有或小号已被移出,无法访问",
+    "UserDeactivatedError": "账号已被注销",
+    "UserDeactivatedBanError": "账号已被封禁",
+    "ChatAdminRequiredError": "需要管理员权限",
+    "PeerFloodError": "操作过于频繁,账号被临时限制",
+    "SlowModeWaitError": "该群开启了慢速模式,需等待后再发",
+}
+
 # 关键字片段 → 中文(按 RPCError.message 或异常类名匹配)
 _MESSAGE_MAP: dict[str, str] = {
     "USER_PRIVACY_RESTRICTED": "对方设置了隐私限制,无法加入或邀请",
@@ -41,6 +55,10 @@ def translate(exc: BaseException) -> str:
     # FloodWait:带剩余秒数
     if isinstance(exc, errors.FloodWaitError):
         return f"操作频率过高,请等待 {exc.seconds} 秒后重试"
+    # 类名优先匹配:某些异常的 .message 是 BAD_REQUEST,只能靠类名识别
+    zh = _CLASS_NAME_MAP.get(type(exc).__name__)
+    if zh is not None:
+        return zh
     if isinstance(exc, errors.SessionPasswordNeededError):
         return "该账号开启了二级密码(2FA),请提交 2FA 密码"
     if isinstance(exc, errors.PhoneCodeInvalidError):

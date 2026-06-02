@@ -280,7 +280,14 @@ async def update_profile(phone: str, first_name, last_name, username, bio) -> No
                 first_name=first_name, last_name=last_name, about=bio,
             ))
         if username is not None:
-            await client(functions.account.UpdateUsernameRequest(username=username))
+            # Telegram 要求纯用户名,不能带 @ 前缀,否则报 "username is unacceptable"
+            clean_username = username.strip().lstrip("@")
+            # 取实时用户名对比:未变化则跳过,否则对自己已有的用户名重复设置
+            # Telegram 会报 "Nobody is using this username"。
+            me = await client.get_me()
+            current = (getattr(me, "username", None) or "").strip()
+            if clean_username != current:
+                await client(functions.account.UpdateUsernameRequest(username=clean_username))
     except errors.FloodWaitError as exc:
         raise AccountError(f"操作频率过高,请等待 {exc.seconds} 秒") from exc
     except Exception as exc:

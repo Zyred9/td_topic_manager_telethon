@@ -86,34 +86,6 @@ async def run_leave(phones: List[str], chat_id: int, batch_id: str) -> None:
     batch_store.finish(batch_id)
 
 
-# ---------- 群发消息 ----------
-async def run_broadcast(phones: List[str], chat_id: int, content: str, batch_id: str) -> None:
-    """勾选小号在指定群内统一发送一段文本。
-
-    异步 + 每号之间随机抖动(复用加群的 jitter 配置)防风控;进度写 batch_store,
-    失败原因经 td_error 转中文。未就绪 / 不在群的号记失败,不中断其余号。
-    """
-    risk = get_settings().risk
-    logger.info("[群发] 批次=%s 目标群=%s 号数=%d", batch_id, chat_id, len(phones))
-    for phone in phones:
-        await asyncio.sleep(random.uniform(risk.join_jitter_min_sec, risk.join_jitter_max_sec))
-        client = client_manager.get_ready_client(phone)
-        if client is None:
-            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason="小号未就绪")
-            continue
-        try:
-            entity = await client.get_entity(chat_id)
-            await client.send_message(entity, content)
-            batch_store.set_item(batch_id, phone, ITEM_SUCCESS, chat_id=chat_id)
-            logger.info("[群发] %s 已发送 chat=%s", phone, chat_id)
-        except Exception as exc:
-            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
-            logger.warning("[群发] %s 失败 群=%s 异常类型=%s 异常=%s",
-                           phone, chat_id, type(exc).__name__, exc)
-            logger.debug("[群发] %s 失败堆栈", phone, exc_info=True)
-    batch_store.finish(batch_id)
-
-
 # ---------- 单号单群退群(同步返回) ----------
 async def leave_one(phone: str, chat_id: int) -> None:
     """单个小号退出单个群,同步返回。失败抛异常(中文)。"""

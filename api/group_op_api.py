@@ -5,7 +5,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from api.deps import BizError, CurrentUser, get_current_user, result
-from api.schemas import GroupBroadcastReq, GroupOpReq
+from api.schemas import GroupOpReq
 from core.batch_store import batch_store
 from core.lifecycle import task_tracker
 from services import group_op_service
@@ -28,17 +28,6 @@ async def leave(req: GroupOpReq, _: CurrentUser = Depends(get_current_user)) -> 
         raise BizError("缺少群 ID")
     batch_id = batch_store.create("leave", len(req.phones))
     task_tracker.create_task(group_op_service.run_leave(req.phones, req.chatId, batch_id))
-    return result(batch_id)
-
-
-@router.post("/broadcast")
-async def broadcast(req: GroupBroadcastReq, _: CurrentUser = Depends(get_current_user)) -> dict:
-    if not req.phones:
-        raise BizError("请先勾选小号")
-    if not req.content.strip():
-        raise BizError("缺少发送文本")
-    batch_id = batch_store.create("broadcast", len(req.phones))
-    task_tracker.create_task(group_op_service.run_broadcast(req.phones, req.chatId, req.content, batch_id))
     return result(batch_id)
 
 

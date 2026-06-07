@@ -64,13 +64,6 @@ class GroupOpReq(BaseModel):
     chatId: Optional[int] = None
 
 
-class GroupBroadcastReq(BaseModel):
-    """群发消息:勾选小号在指定群内统一发送一段文本。"""
-    phones: List[str]
-    chatId: int
-    content: str
-
-
 # ========== schedule ==========
 class ScheduleStartReq(BaseModel):
     chatIds: List[int]

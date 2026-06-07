@@ -22,6 +22,27 @@ def list_running() -> List[dict]:
             return cur.fetchall()
 
 
+def list_all() -> List[dict]:
+    """全部定时任务,按更新时间倒序(最近操作的在前)。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM t_schedule_task ORDER BY update_time DESC")
+            return cur.fetchall()
+
+
+def find_by_id(task_id: int) -> Optional[dict]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM t_schedule_task WHERE id=%s", (task_id,))
+            return cur.fetchone()
+
+
+def delete_by_id(task_id: int) -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM t_schedule_task WHERE id=%s", (task_id,))
+
+
 def upsert_start(phone: str, chat_ids: str, content: str, interval_min: int) -> None:
     now = datetime.now()
     sql = (

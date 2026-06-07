@@ -28,12 +28,8 @@ def _normalize(phone: str) -> str:
     return p if p.startswith("+") else f"+{p}"
 
 
-async def get_config(phone: str) -> Optional[dict]:
-    """返回前端 ScheduleTask|null。"""
-    phone = _normalize(phone)
-    row = await run_db(schedule_repo.find_by_phone, phone)
-    if row is None:
-        return None
+def _to_vo(row: dict) -> dict:
+    """t_schedule_task 行 → 前端 ScheduleTask VO。"""
     return {
         "id": row["id"],
         "phone": row["phone"],
@@ -43,6 +39,21 @@ async def get_config(phone: str) -> Optional[dict]:
         "status": row["status"],
         "lastSent": row["last_sent"].strftime("%Y-%m-%d %H:%M:%S") if row.get("last_sent") else None,
     }
+
+
+async def get_config(phone: str) -> Optional[dict]:
+    """返回前端 ScheduleTask|null。"""
+    phone = _normalize(phone)
+    row = await run_db(schedule_repo.find_by_phone, phone)
+    if row is None:
+        return None
+    return _to_vo(row)
+
+
+async def list_all() -> List[dict]:
+    """全部定时任务列表(给定时任务管理页)。"""
+    rows = await run_db(schedule_repo.list_all)
+    return [_to_vo(row) for row in rows]
 
 
 async def start(phone: str, chat_ids: List[int], content: str, interval_min: int) -> None:
@@ -134,6 +145,71 @@ async def batch_stop(phones: List[str]) -> dict:
             logger.warning("批量停止定时失败 phone=%s", phone, exc_info=exc)
             failed.append({"phone": phone, "reason": "停止异常"})
     logger.info("批量定时停止 成功=%d 失败=%d", len(ok), len(failed))
+    return {"ok": ok, "failed": failed}
+
+
+# ---------- 按 id 管理(定时任务管理页) ----------
+async def delete(task_id: int) -> None:
+    """删除单条定时任务:先停运行中的发送协程,再删 DB 行。"""
+    row = await run_db(schedule_repo.find_by_id, task_id)
+    if row is None:
+        raise ValueError("任务不存在")
+    await _cancel_task(_normalize(row["phone"]))
+    await run_db(schedule_repo.delete_by_id, task_id)
+    logger.info("定时任务删除 id=%s phone=%s", task_id, row["phone"])
+
+
+async def restart(task_id: int) -> None:
+    """用表里存的原配置重启单条定时任务。"""
+    row = await run_db(schedule_repo.find_by_id, task_id)
+    if row is None:
+        raise ValueError("任务不存在")
+    chat_ids = [int(c) for c in str(row["chat_ids"]).split(",") if c.strip()]
+    await start(row["phone"], chat_ids, row["content"], row["interval_min"])
+    logger.info("定时任务重启 id=%s phone=%s", task_id, row["phone"])
+
+
+async def batch_delete(ids: List[int]) -> dict:
+    """批量删除定时任务。逐 id 隔离,返回成功/失败列表。"""
+    ok: List[str] = []
+    failed: List[dict] = []
+    for task_id in ids:
+        try:
+            await delete(task_id)
+            ok.append(str(task_id))
+        except ValueError as exc:
+            failed.append({"phone": str(task_id), "reason": str(exc)})
+        except Exception as exc:
+            logger.warning("批量删除定时任务失败 id=%s", task_id, exc_info=exc)
+            failed.append({"phone": str(task_id), "reason": "删除异常"})
+    logger.info("批量删除定时任务 成功=%d 失败=%d", len(ok), len(failed))
+    return {"ok": ok, "failed": failed}
+
+
+async def batch_restart(ids: List[int]) -> dict:
+    """批量重启定时任务(用各自表里的原配置)。逐 id 隔离,返回成功/失败列表。"""
+    from core.client_manager import client_manager
+
+    ok: List[str] = []
+    failed: List[dict] = []
+    for task_id in ids:
+        row = await run_db(schedule_repo.find_by_id, task_id)
+        if row is None:
+            failed.append({"phone": str(task_id), "reason": "任务不存在"})
+            continue
+        phone = _normalize(row["phone"])
+        if client_manager.get_ready_client(phone) is None:
+            failed.append({"phone": phone, "reason": "小号未就绪(未登录/离线)"})
+            continue
+        try:
+            await restart(task_id)
+            ok.append(phone)
+        except ValueError as exc:
+            failed.append({"phone": phone, "reason": str(exc)})
+        except Exception as exc:
+            logger.warning("批量重启定时任务失败 id=%s", task_id, exc_info=exc)
+            failed.append({"phone": phone, "reason": "重启异常"})
+    logger.info("批量重启定时任务 成功=%d 失败=%d", len(ok), len(failed))
     return {"ok": ok, "failed": failed}
 
 

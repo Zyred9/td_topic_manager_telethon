@@ -90,6 +90,11 @@ class ScheduleBatchStopReq(BaseModel):
     phones: List[str]
 
 
+class ScheduleBatchIdsReq(BaseModel):
+    """按任务 id 批量操作(定时任务管理页:删除 / 重启)。"""
+    ids: List[int]
+
+
 # ========== dm 私聊记录 ==========
 class DmMessageDeleteReq(BaseModel):
     """批量删除私聊消息(按 DB 主键 id)。"""

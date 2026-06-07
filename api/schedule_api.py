@@ -5,7 +5,12 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 
 from api.deps import BizError, CurrentUser, get_current_user, result
-from api.schemas import ScheduleBatchStartReq, ScheduleBatchStopReq, ScheduleStartReq
+from api.schemas import (
+    ScheduleBatchIdsReq,
+    ScheduleBatchStartReq,
+    ScheduleBatchStopReq,
+    ScheduleStartReq,
+)
 from services import schedule_service
 
 router = APIRouter(prefix="/schedule", tags=["schedule"])
@@ -32,6 +37,36 @@ async def batch_stop_schedule(
         raise BizError("请先勾选小号")
     data = await schedule_service.batch_stop(req.phones)
     return result(data)
+
+
+# ===== 定时任务管理页:列表 / 批量删除 / 批量重启 =====
+# 同样放在 /{phone} 之前,避免 "" 与 "batch" 段被当作 phone 匹配
+
+
+@router.get("")
+async def list_schedule_tasks(_: CurrentUser = Depends(get_current_user)) -> dict:
+    """全部定时任务列表。"""
+    return result(await schedule_service.list_all())
+
+
+@router.post("/batch/delete")
+async def batch_delete_schedule(
+    req: ScheduleBatchIdsReq, _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """按 id 批量删除定时任务(先停协程再删 DB)。"""
+    if not req.ids:
+        raise BizError("请先勾选任务")
+    return result(await schedule_service.batch_delete(req.ids))
+
+
+@router.post("/batch/restart")
+async def batch_restart_schedule(
+    req: ScheduleBatchIdsReq, _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """按 id 批量重启定时任务(用表里原配置)。"""
+    if not req.ids:
+        raise BizError("请先勾选任务")
+    return result(await schedule_service.batch_restart(req.ids))
 
 
 @router.get("/{phone}")

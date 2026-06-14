@@ -59,9 +59,13 @@ def page(
       - "all": 全部,死号也看得到 (主列表加了死号过滤下拉后用)
       - "dead": 只看死号 (is_dead=1)
     dead_sort_first:
-      - None: 不按 is_dead 排序,沿用 login_time DESC, id DESC (默认)
-      - True: 死号靠前 → is_dead DESC + dead_time DESC + login_time DESC + id DESC
-      - False: 死号靠后 → is_dead ASC + login_time DESC + id DESC
+      - None: 不按 is_dead 排序 → update_time ASC, login_time DESC, id DESC
+      - True: 死号靠前 → is_dead DESC + dead_time DESC + update_time ASC + login_time DESC + id DESC
+      - False: 死号靠后 → is_dead ASC + update_time ASC + login_time DESC + id DESC
+
+    update_time ASC:把「web 编辑过资料」的号排到最后(改资料会刷新 update_time,
+    值越新越靠后),从未编辑过的号 update_time 仍为初始值(≈create_time)排在前面。
+    优先级:死号沉底(若启用)> 改过资料沉底 > 登录时间倒序。
     """
     where: list[str] = []
     params: list = []
@@ -80,11 +84,11 @@ def page(
     clause = f" WHERE {' AND '.join(where)}" if where else ""
 
     if dead_sort_first is True:
-        order_by = "is_dead DESC, dead_time DESC, login_time DESC, id DESC"
+        order_by = "is_dead DESC, dead_time DESC, update_time ASC, login_time DESC, id DESC"
     elif dead_sort_first is False:
-        order_by = "is_dead ASC, login_time DESC, id DESC"
+        order_by = "is_dead ASC, update_time ASC, login_time DESC, id DESC"
     else:
-        order_by = "login_time DESC, id DESC"
+        order_by = "update_time ASC, login_time DESC, id DESC"
 
     if page_no < 1:
         page_no = 1
@@ -139,26 +143,27 @@ def mark_dead(phone: str, err_code: str, err_desc: str) -> int:
     """
     reason = f"{err_code}: {err_desc}"[:255]  # VARCHAR(255) 截断
     now = datetime.now()
+    # 不写 update_time:判死不是「编辑资料」。死号有独立的 dead_time 记录判定时间。
     sql = (
         "UPDATE t_account SET is_dead=1, dead_reason=%s, dead_time=%s, "
-        "status=5, update_time=%s WHERE phone=%s AND is_dead=0"
+        "status=5 WHERE phone=%s AND is_dead=0"
     )
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (reason, now, now, phone))
+            cur.execute(sql, (reason, now, phone))
             return int(cur.rowcount)
 
 
 def revive(phone: str) -> int:
     """复活死号:is_dead=0,status=0(未登录,运营走重新登录),清空死号字段。"""
-    now = datetime.now()
+    # 不写 update_time:复活不是「编辑资料」,不影响小号列表排序。
     sql = (
         "UPDATE t_account SET is_dead=0, dead_reason=NULL, dead_time=NULL, "
-        "status=0, update_time=%s WHERE phone=%s AND is_dead=1"
+        "status=0 WHERE phone=%s AND is_dead=1"
     )
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (now, phone))
+            cur.execute(sql, (phone,))
             return int(cur.rowcount)
 
 
@@ -172,7 +177,12 @@ def upsert_protocol(
     lang_pack: Optional[str],
     two_fa: Optional[str],
 ) -> None:
-    """协议号导入 upsert(import_type=2)。冲突时更新凭证与 session_path。"""
+    """协议号导入 upsert(import_type=2)。冲突时更新凭证与 session_path。
+
+    注意:update_time 已被语义专用化为「web 编辑资料时间」(用于小号列表排序,改过
+    资料的号沉底)。导入不属于编辑资料,故插入时 update_time 落 create_time(= now),
+    冲突更新分支不再触碰 update_time,避免污染排序。
+    """
     now = datetime.now()
     sql = (
         "INSERT INTO t_account (phone, import_type, session_path, api_id, api_hash, "
@@ -181,7 +191,7 @@ def upsert_protocol(
         "ON DUPLICATE KEY UPDATE session_path=VALUES(session_path), api_id=VALUES(api_id), "
         "api_hash=VALUES(api_hash), device_model=VALUES(device_model), "
         "app_version=VALUES(app_version), lang_pack=VALUES(lang_pack), "
-        "two_fa=VALUES(two_fa), status=1, update_time=VALUES(update_time)"
+        "two_fa=VALUES(two_fa), status=1"
     )
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -190,13 +200,16 @@ def upsert_protocol(
 
 
 def upsert_phone(phone: str, session_path: str) -> None:
-    """手机号登录 upsert(import_type=1,用全局凭证,api 字段留空)。"""
+    """手机号登录 upsert(import_type=1,用全局凭证,api 字段留空)。
+
+    update_time 语义同 upsert_protocol:插入落 create_time,冲突更新不动它(登录不是编辑资料)。
+    """
     now = datetime.now()
     sql = (
         "INSERT INTO t_account (phone, import_type, session_path, status, create_time, update_time) "
         "VALUES (%s, 1, %s, 1, %s, %s) "
         "ON DUPLICATE KEY UPDATE session_path=VALUES(session_path), import_type=1, "
-        "status=1, update_time=VALUES(update_time)"
+        "status=1"
     )
     with get_connection() as conn:
         with conn.cursor() as cur:
@@ -204,29 +217,43 @@ def upsert_phone(phone: str, session_path: str) -> None:
 
 
 def update_status(phone: str, status: int) -> None:
+    # 不写 update_time:状态变更不是「web 编辑资料」,不应影响小号列表排序。
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE t_account SET status=%s, update_time=%s WHERE phone=%s",
-                (status, datetime.now(), phone),
+                "UPDATE t_account SET status=%s WHERE phone=%s",
+                (status, phone),
             )
 
 
 def mark_logged_in(phone: str, tg_user_id: Optional[int], first_name: Optional[str],
                    last_name: Optional[str], username: Optional[str]) -> None:
-    """登录成功:回填 TG 信息 + status=3 + login_time。"""
+    """登录成功:回填 TG 信息 + status=3 + login_time。
+
+    不写 update_time:登录回填(含巡检同步 TG 昵称)不是 web 主动编辑资料,
+    若刷 update_time 会把巡检同步过的号误判为「改过资料」排到最后,污染排序。
+    """
     now = datetime.now()
     sql = (
         "UPDATE t_account SET status=3, tg_user_id=%s, tg_first_name=%s, tg_last_name=%s, "
-        "tg_username=%s, login_time=%s, update_time=%s WHERE phone=%s"
+        "tg_username=%s, login_time=%s WHERE phone=%s"
     )
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (tg_user_id, first_name, last_name, username, now, now, phone))
+            cur.execute(sql, (tg_user_id, first_name, last_name, username, now, phone))
 
 
 def update_profile(phone: str, first_name: Optional[str], last_name: Optional[str],
-                   username: Optional[str], bio: Optional[str]) -> None:
+                   username: Optional[str], bio: Optional[str],
+                   touch_edit_time: bool = True) -> None:
+    """回写小号资料字段。
+
+    touch_edit_time:是否刷新 update_time(=「web 编辑资料时间」,小号列表据此把改过
+    资料的号排到最后)。
+      - True(默认):web 主动「编辑资料」,刷新,使该号沉底。
+      - False:巡检 _sync_profile 自动同步 TG 昵称时传,只回写昵称不刷时间,
+        否则巡检会把任何在 TG 改过名的号误判为「改过资料」持续污染排序。
+    """
     sets: list[str] = []
     params: list = []
     for col, val in (("tg_first_name", first_name), ("tg_last_name", last_name),
@@ -236,8 +263,10 @@ def update_profile(phone: str, first_name: Optional[str], last_name: Optional[st
             params.append(val)
     if not sets:
         return
-    sets.append("update_time=%s")
-    params += [datetime.now(), phone]
+    if touch_edit_time:
+        sets.append("update_time=%s")
+        params.append(datetime.now())
+    params.append(phone)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(f"UPDATE t_account SET {', '.join(sets)} WHERE phone=%s", tuple(params))
@@ -253,11 +282,12 @@ def update_avatar(phone: str, avatar_path: str) -> None:
 
 
 def update_persona(phone: str, persona_json: Optional[str]) -> None:
+    # 不写 update_time:AI 人设不是「编辑资料」,不影响小号列表排序。
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE t_account SET persona_json=%s, update_time=%s WHERE phone=%s",
-                (persona_json, datetime.now(), phone),
+                "UPDATE t_account SET persona_json=%s WHERE phone=%s",
+                (persona_json, phone),
             )
 
 

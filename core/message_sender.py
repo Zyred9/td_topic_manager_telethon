@@ -23,6 +23,7 @@ from config.constants import SendSource
 from core.client_manager import client_manager
 from core.throttle import throttle
 from helpers import td_error
+from helpers.dead_account import is_dead_error
 from infra.db import run_db
 from repositories import account_repo, send_log_repo
 
@@ -30,21 +31,6 @@ logger = logging.getLogger(__name__)
 
 # 配额耗尽时:即时类丢弃(过期无意义),周期类跳过下轮补偿
 _DROP_WHEN_FULL = {SendSource.KEYWORD, SendSource.AI_REPLY}
-
-# session 被作废 / 账号被封等终态异常 → 自动判死
-# 同步 account_watch_service._DEAD_ERRORS 的口径,新增 Session* 两个
-_DEAD_ERRORS = (
-    errors.AuthKeyDuplicatedError,
-    errors.AuthKeyUnregisteredError,
-    errors.UserDeactivatedError,
-    errors.UserDeactivatedBanError,
-)
-# Telethon 1.43.2 上 SessionRevokedError / SessionExpiredError 不一定都暴露在
-# errors 顶层,用 getattr 兜底,确保不会 import 报错;真不存在就算了。
-for _name in ("SessionRevokedError", "SessionExpiredError"):
-    _cls = getattr(errors, _name, None)
-    if _cls is not None and _cls not in _DEAD_ERRORS:
-        _DEAD_ERRORS = _DEAD_ERRORS + (_cls,)
 
 
 async def _log_send(
@@ -127,29 +113,23 @@ async def send_text(
             throttle.incr_minute(phone)
             await _log_send(phone, chat_id, source, ok=True, content_preview=preview)
             return True, ""
-        except _DEAD_ERRORS as exc2:
-            logger.error("[发送] phone=%s chat=%s 退避后死号异常: %s", phone, chat_id, exc2)
-            await _log_send(phone, chat_id, source, ok=False,
-                            err_code=type(exc2).__name__, err_message=td_error.translate(exc2),
-                            content_preview=preview)
-            await _mark_dead_and_remove(phone, exc2)
-            return False, f"账号已失效({type(exc2).__name__})"
         except Exception as exc2:
-            logger.error("[发送] phone=%s chat=%s 退避后仍失败: %s", phone, chat_id, exc2)
             await _log_send(phone, chat_id, source, ok=False,
                             err_code=type(exc2).__name__, err_message=td_error.translate(exc2),
                             content_preview=preview)
+            if is_dead_error(exc2):
+                logger.error("[发送] phone=%s chat=%s 退避后死号异常: %s", phone, chat_id, exc2)
+                await _mark_dead_and_remove(phone, exc2)
+                return False, f"账号已失效({type(exc2).__name__})"
+            logger.error("[发送] phone=%s chat=%s 退避后仍失败: %s", phone, chat_id, exc2)
             return False, td_error.translate(exc2)
-    except _DEAD_ERRORS as exc:
-        logger.error("[发送] phone=%s chat=%s 死号异常: %s", phone, chat_id, exc)
-        await _log_send(phone, chat_id, source, ok=False,
-                        err_code=type(exc).__name__, err_message=td_error.translate(exc),
-                        content_preview=preview)
-        await _mark_dead_and_remove(phone, exc)
-        return False, f"账号已失效({type(exc).__name__})"
     except Exception as exc:
-        logger.error("[发送] phone=%s chat=%s 失败: %s", phone, chat_id, exc)
         await _log_send(phone, chat_id, source, ok=False,
                         err_code=type(exc).__name__, err_message=td_error.translate(exc),
                         content_preview=preview)
+        if is_dead_error(exc):
+            logger.error("[发送] phone=%s chat=%s 死号异常: %s", phone, chat_id, exc)
+            await _mark_dead_and_remove(phone, exc)
+            return False, f"账号已失效({type(exc).__name__})"
+        logger.error("[发送] phone=%s chat=%s 失败: %s", phone, chat_id, exc)
         return False, td_error.translate(exc)

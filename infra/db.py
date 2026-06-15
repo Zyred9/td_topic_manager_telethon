@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import queue
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable, Iterator, TypeVar
@@ -23,28 +25,137 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 
+class _ConnectionPool:
+    """轻量 MySQL 连接池(纯标准库 + pymysql,零额外依赖)。
+
+    解决 FD 耗尽:此前每次 ``get_connection()`` 都新建一条 TCP 连接用完即弃,
+    高频(web + 巡检 + 自驱)下瞬时建连密集、徒增 socket FD 占用。改为复用固定上限
+    的连接,把 DB 侧并发连接钳在 ``pool_max`` 以内,空闲连接复用减少建连开销。
+
+    线程安全:repository 全部经 ``run_db`` 跑在 ``asyncio.to_thread`` 线程池里,
+    故池用 ``queue.Queue`` 做跨线程的连接借还,不依赖 event loop。
+    借出超过 ``pool_max`` 时阻塞等待空闲连接(``Queue.get`` 自带等待)。
+    """
+
+    def __init__(self, max_size: int, min_size: int) -> None:
+        self._max_size = max(1, max_size)
+        self._idle: queue.Queue[Connection] = queue.Queue(maxsize=self._max_size)
+        self._lock = threading.Lock()
+        # 已创建(在用 + 空闲)的连接总数,用于决定是否还能新建
+        self._created = 0
+        # 预热:启动即建 min_size 条,避免首批请求集中建连
+        for _ in range(max(0, min(min_size, self._max_size))):
+            self._idle.put_nowait(self._new_connection())
+            self._created += 1
+
+    def _new_connection(self) -> Connection:
+        cfg = get_settings().db
+        return pymysql.connect(
+            host=cfg.host,
+            port=cfg.port,
+            user=cfg.user,
+            password=cfg.password,
+            database=cfg.database,
+            autocommit=False,
+            charset="utf8mb4",
+            cursorclass=pymysql.cursors.DictCursor,
+        )
+
+    def borrow(self) -> Connection:
+        """借一条可用连接:① 优先复用空闲;② 无空闲且未达上限则新建;③ 已达上限阻塞等归还。"""
+        # 1) 优先拿空闲连接(非阻塞),复用为主、新建为辅
+        try:
+            conn = self._idle.get_nowait()
+            return self._ensure_alive(conn)
+        except queue.Empty:
+            pass
+        # 2) 无空闲:未达上限可新建一条
+        with self._lock:
+            can_create = self._created < self._max_size
+            if can_create:
+                self._created += 1
+        if can_create:
+            try:
+                return self._new_connection()
+            except Exception:
+                # 建连失败要回退计数,否则池子会永久少一个名额
+                with self._lock:
+                    self._created -= 1
+                raise
+        # 3) 已达上限:阻塞等空闲连接归还,把并发连接钳在 max_size;ping 校验存活
+        conn = self._idle.get()
+        return self._ensure_alive(conn)
+
+    def _ensure_alive(self, conn: Connection) -> Connection:
+        try:
+            conn.ping(reconnect=True)
+            return conn
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            return self._new_connection()
+
+    def give_back(self, conn: Connection, broken: bool = False) -> None:
+        """归还连接。broken=True(执行中抛错且无法复用)则丢弃并补名额。"""
+        if broken:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created -= 1
+            return
+        try:
+            self._idle.put_nowait(conn)
+        except queue.Full:
+            # 理论上不会满(借还配对),兜底直接关
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with self._lock:
+                self._created -= 1
+
+
+_pool: _ConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> _ConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                cfg = get_settings().db
+                _pool = _ConnectionPool(cfg.pool_max, cfg.pool_min)
+                logger.info("MySQL 连接池已初始化 max=%d min=%d", cfg.pool_max, cfg.pool_min)
+    return _pool
+
+
 @contextmanager
 def get_connection() -> Iterator[Connection]:
-    """产出一个自动 commit/rollback 的 MySQL 连接。"""
-    cfg = get_settings().db
-    connection = pymysql.connect(
-        host=cfg.host,
-        port=cfg.port,
-        user=cfg.user,
-        password=cfg.password,
-        database=cfg.database,
-        autocommit=False,
-        charset="utf8mb4",
-        cursorclass=pymysql.cursors.DictCursor,
-    )
+    """从连接池借一条自动 commit/rollback 的 MySQL 连接,用完归还(不真断)。
+
+    对调用方语义与旧版完全一致(``with get_connection() as conn:``),仅底层由
+    「每次新建」改为「池内复用」,以止住 socket FD 耗尽并降低建连开销。
+    """
+    pool = _get_pool()
+    connection = pool.borrow()
+    broken = False
     try:
         yield connection
         connection.commit()
     except Exception:
-        connection.rollback()
+        # 回滚失败说明连接本身坏了(网络断/服务端踢),标记 broken 由池丢弃重建
+        try:
+            connection.rollback()
+        except Exception:
+            broken = True
         raise
     finally:
-        connection.close()
+        pool.give_back(connection, broken=broken)
 
 
 async def run_db(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:

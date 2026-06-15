@@ -65,6 +65,9 @@ class DbConfig:
     user: str
     password: str
     database: str
+    # 连接池:钳住峰值连接数(同时压低 DB 侧 FD 占用),空闲连接复用减少建连开销
+    pool_max: int = 16
+    pool_min: int = 2
 
 
 @dataclass(frozen=True)
@@ -177,6 +180,8 @@ def get_settings() -> Settings:
             user=_get_prefixed("DB_USER", "root"),
             password=_get_prefixed("DB_PASSWORD", ""),
             database=_get("DB_NAME", "td_topic_manager"),
+            pool_max=_get_int("DB_POOL_MAX", 16),
+            pool_min=_get_int("DB_POOL_MIN", 2),
         ),
         telegram=TelegramConfig(
             api_id=_get_prefixed_int("TG_API_ID", 0),

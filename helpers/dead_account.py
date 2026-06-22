@@ -18,13 +18,22 @@ message_sender(发送链路)与 account_watch_service(巡检链路)共用,不得
 
 from __future__ import annotations
 
+import logging
+
 from telethon import errors
+
+logger = logging.getLogger(__name__)
 
 # 不在 UnauthorizedError 基类下、但仍属终态失效,需显式补充的异常类型
 _EXTRA_DEAD_ERRORS: tuple[type[BaseException], ...] = (
     errors.AuthKeyDuplicatedError,
     errors.PhoneNumberBannedError,
 )
+
+# 「发送受限」死号的 err_code:号能登录(get_me 成功)但持续发不出消息(双向/被限制/被禁言)。
+# 不是 Telethon 异常类名,是巡检按发送日志统计判出来的,用独立 code 让运营在死号列表
+# 一眼区分「登录都登不上的真死号」与「能登录但发不出的受限号」。
+SEND_BLOCKED_CODE = "SEND_BLOCKED"
 
 
 def is_dead_error(exc: BaseException) -> bool:
@@ -38,3 +47,49 @@ def is_dead_error(exc: BaseException) -> bool:
     if isinstance(exc, errors.UnauthorizedError):
         return True
     return isinstance(exc, _EXTRA_DEAD_ERRORS)
+
+
+async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
+    """死号统一落库口径(全项目唯一实现):标 is_dead=1 + 移出 client 池。
+
+    所有链路(发送 / 巡检 / 启动 / 登录 / 导入 / 群操作 / 移交群主 / 私聊下载)捕获到
+    is_dead_error(exc)==True 的终态异常后,都应调用本函数,不得各写一份(铁律:禁止重复)。
+    幂等:mark_dead 内 WHERE is_dead=0 保证只标第一次。返回 True 表示本次确实把号标进了
+    死号集合(affected>0),调用方可据此决定给运营的提示文案。失败仅记日志、不抛,绝不阻塞
+    调用方主流程。
+
+    延迟 import account_repo / client_manager:本模块被 message_sender 等底层模块依赖,
+    模块级 import 会形成循环,放函数内规避。
+    """
+    return await _mark_and_remove(phone, type(exc).__name__, str(exc))
+
+
+async def mark_send_blocked(phone: str, desc: str) -> bool:
+    """标「发送受限」死号:号能登录但持续发不出消息(双向/被限制/被禁言)。
+
+    与 mark_dead_and_remove 共用落库+出池实现,只是 err_code 用语义化的
+    SEND_BLOCKED_CODE(非 Telethon 异常类名),让运营在死号列表里能区分两类死法。
+    """
+    return await _mark_and_remove(phone, SEND_BLOCKED_CODE, desc)
+
+
+async def _mark_and_remove(phone: str, err_code: str, err_desc: str) -> bool:
+    """死号落库的唯一实现:标 is_dead=1(幂等,WHERE is_dead=0)+ 移出 client 池。
+    失败仅记日志、不抛,绝不阻塞调用方主流程。"""
+    from core.client_manager import client_manager
+    from infra.db import run_db
+    from repositories import account_repo
+
+    marked = False
+    try:
+        affected = await run_db(account_repo.mark_dead, phone, err_code, err_desc)
+        marked = bool(affected)
+        if marked:
+            logger.warning("[死号] phone=%s 已标记失效 reason=%s", phone, err_code)
+    except Exception as e2:
+        logger.warning("[死号] 标记失败 phone=%s: %s", phone, e2)
+    try:
+        await client_manager.remove(phone)
+    except Exception as e2:
+        logger.warning("[死号] 移出 client 池失败 phone=%s: %s", phone, e2)
+    return marked

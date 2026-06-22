@@ -20,9 +20,9 @@ from typing import Dict, Optional
 from config.constants import AccountStatus
 from config.settings import get_settings
 from core.client_manager import client_manager
-from helpers.dead_account import is_dead_error
+from helpers.dead_account import is_dead_error, mark_dead_and_remove, mark_send_blocked
 from infra.db import run_db
-from repositories import account_repo
+from repositories import account_repo, send_log_repo
 
 logger = logging.getLogger(__name__)
 
@@ -46,10 +46,9 @@ def _clear_streak(phone: str) -> None:
 
 
 async def _mark_dead(phone: str, exc: BaseException) -> None:
-    """命中终态死号异常:标 is_dead=1、移出池、清失败计数。"""
+    """命中终态死号异常:走公共口径标死+出池,并清本服务的失败计数。"""
     logger.warning("巡检判定死号 phone=%s reason=%s", phone, type(exc).__name__, exc_info=exc)
-    await run_db(account_repo.mark_dead, phone, type(exc).__name__, str(exc))
-    await client_manager.remove(phone)
+    await mark_dead_and_remove(phone, exc)
     _clear_streak(phone)
 
 
@@ -63,8 +62,7 @@ async def _on_ambiguous_fail(phone: str, exc: BaseException) -> None:
     if streak >= _DEAD_CONFIRM_ROUNDS:
         logger.warning("巡检探活连续 %d 轮失败,判定死号 phone=%s reason=%s",
                        streak, phone, type(exc).__name__, exc_info=exc)
-        await run_db(account_repo.mark_dead, phone, type(exc).__name__, str(exc))
-        await client_manager.remove(phone)
+        await mark_dead_and_remove(phone, exc)
         _clear_streak(phone)
     else:
         logger.warning("巡检探活失败(第 %d/%d 轮),先置离线观察 phone=%s",
@@ -112,6 +110,25 @@ async def _check_one(phone: str) -> None:
     # 探活成功:清零失败计数,同步实时资料(问题5)
     _clear_streak(phone)
     await _sync_profile(phone, me)
+    # 号能登录 ≠ 能发消息:再查发送日志,持续发不出(双向/被限制)也判死号
+    await _check_send_health(phone)
+
+
+async def _check_send_health(phone: str) -> None:
+    """发送受限检测:号 get_me() 成功(活着)但近期持续发不出消息时判「发送受限」死号。
+
+    判据:近 window 小时内失败数 ≥ 阈值 且 零成功 —— 偶发失败(网络抖动/单次 FloodWait)
+    不会触发;只有「一直发不出去」才判,避免误杀。统计已排除 NOT_READY/QUOTA_FULL 这类
+    没真发出去的本地拦截。零成功是关键:只要这窗口内还有一条发成功,就说明号能发,不判死。
+    """
+    wcfg = get_settings().watch
+    fail, ok = await run_db(
+        send_log_repo.count_results_since, phone, wcfg.send_fail_window_hours,
+    )
+    if fail >= wcfg.send_fail_threshold and ok == 0:
+        desc = f"近 {wcfg.send_fail_window_hours}h 发送失败 {fail} 次且无一成功,疑似双向/被限制"
+        logger.warning("[死号] phone=%s 发送受限判死: %s", phone, desc)
+        await mark_send_blocked(phone, desc)
 
 
 async def _sync_profile(phone: str, me) -> None:

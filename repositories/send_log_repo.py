@@ -40,6 +40,27 @@ def insert(
             ))
 
 
+def count_results_since(phone: str, hours: int) -> Tuple[int, int]:
+    """统计某号近 hours 小时的发送结果,返回 (失败数, 成功数)。
+
+    供巡检判「发送受限」死号:号能登录但近期持续发不出(失败多且零成功)。
+    NOT_READY/QUOTA_FULL 这类本地拦截(还没真发出去)的失败不计入,避免误判 —
+    只统计真正走到 client.send_message 才失败的网络/权限类失败。
+    """
+    since = datetime.now() - timedelta(hours=hours)
+    sql = (
+        "SELECT "
+        "SUM(CASE WHEN ok=0 AND err_code NOT IN ('NOT_READY','QUOTA_FULL') THEN 1 ELSE 0 END) AS fail, "
+        "SUM(CASE WHEN ok=1 THEN 1 ELSE 0 END) AS ok_cnt "
+        "FROM t_send_log WHERE phone=%s AND send_time >= %s"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (phone, since))
+            row = cur.fetchone() or {}
+    return int(row.get("fail") or 0), int(row.get("ok_cnt") or 0)
+
+
 def page_by_phone(
     phone: str, page_no: int, size: int,
     only_failed: bool = False, hours: Optional[int] = None,

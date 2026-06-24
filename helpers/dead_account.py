@@ -49,6 +49,21 @@ def is_dead_error(exc: BaseException) -> bool:
     return isinstance(exc, _EXTRA_DEAD_ERRORS)
 
 
+def is_send_failure_dead(exc: BaseException) -> bool:
+    """真实发送链路失败时,是否按「能登录但发不出」判死号(运营口径)。
+
+    口径(运营明确要求全拦):号已绑定定时/群聊自动发言,真走到 client.send_message 还失败,
+    无论什么异常(群封 UserBannedInChannel / 双向限制 PeerFlood / 被禁言 ChatWriteForbidden /
+    限流 FloodWait / 超时 / TG 故障 / 未知异常)一律判死号、出池、不再使用。
+
+    终态 session 失效(封号/作废)另由 is_dead_error 先行处理(标准死号),不重复进这里。
+
+    注:限流/超时/TG 故障可能是临时的,本口径也判死,会误杀好号 —— 这是运营明确选择的取舍
+    (宁可错杀、发失败就停用),需要时运营在死号列表里手动复活。
+    """
+    return not is_dead_error(exc)
+
+
 async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
     """死号统一落库口径(全项目唯一实现):标 is_dead=1 + 移出 client 池。
 

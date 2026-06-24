@@ -18,6 +18,12 @@ from config.settings import get_settings
 from core.batch_store import ITEM_FAILED, ITEM_SUCCESS, batch_store
 from core.client_manager import client_manager
 from helpers import link_parser, td_error
+from helpers.dead_account import (
+    is_dead_error,
+    is_send_failure_dead,
+    mark_dead_and_remove,
+    mark_send_blocked,
+)
 from infra.db import run_db
 from repositories import account_watch_repo
 
@@ -46,6 +52,9 @@ async def run_join(phones: List[str], group_link: str, batch_id: str) -> None:
             logger.warning("[加群] %s 失败 原始链接=%r 异常类型=%s 异常=%s",
                            phone, group_link, type(exc).__name__, exc)
             logger.debug("[加群] %s 失败堆栈", phone, exc_info=True)
+            # 终态死号异常 → 判死进死号列表 + 出池(统一口径)
+            if is_dead_error(exc):
+                await mark_dead_and_remove(phone, exc)
     batch_store.finish(batch_id)
 
 
@@ -83,6 +92,8 @@ async def run_leave(phones: List[str], chat_id: int, batch_id: str) -> None:
             logger.info("[退群] %s 退出 chat=%s", phone, chat_id)
         except Exception as exc:
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
+            if is_dead_error(exc):
+                await mark_dead_and_remove(phone, exc)
     batch_store.finish(batch_id)
 
 
@@ -111,6 +122,12 @@ async def run_broadcast(phones: List[str], chat_id: int, content: str, batch_id:
             logger.warning("[群发] %s 失败 群=%s 异常类型=%s 异常=%s",
                            phone, chat_id, type(exc).__name__, exc)
             logger.debug("[群发] %s 失败堆栈", phone, exc_info=True)
+            # 群发是真发消息:终态失效→标准死号;非临时类发不出→「发不出」死号(对齐发送链路口径)
+            if is_dead_error(exc):
+                await mark_dead_and_remove(phone, exc)
+            elif is_send_failure_dead(exc):
+                logger.warning("[群发] %s 发送失败判死(发不出) 群=%s: %s", phone, chat_id, type(exc).__name__)
+                await mark_send_blocked(phone, f"群发失败:{type(exc).__name__} {td_error.translate(exc)}")
     batch_store.finish(batch_id)
 
 
@@ -126,6 +143,8 @@ async def leave_one(phone: str, chat_id: int) -> None:
     except Exception as exc:
         # 即使 TG 端退群失败(如群已不存在),也清理本地路由记录
         await run_db(account_watch_repo.remove, phone, chat_id)
+        if is_dead_error(exc):
+            await mark_dead_and_remove(phone, exc)
         raise RuntimeError(td_error.translate(exc)) from exc
     await run_db(account_watch_repo.remove, phone, chat_id)
     logger.info("[退群] %s 退出 chat=%s", phone, chat_id)
@@ -148,6 +167,8 @@ async def check_member(phones: List[str], chat_id: int) -> dict:
                 not_in.append({"phone": phone, "reason": "不在该群或无发言权限"})
         except Exception as exc:
             not_in.append({"phone": phone, "reason": td_error.translate(exc)})
+            if is_dead_error(exc):
+                await mark_dead_and_remove(phone, exc)
     return {"in": in_list, "notIn": not_in}
 
 

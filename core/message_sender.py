@@ -23,9 +23,14 @@ from config.constants import SendSource
 from core.client_manager import client_manager
 from core.throttle import throttle
 from helpers import td_error
-from helpers.dead_account import is_dead_error
+from helpers.dead_account import (
+    is_dead_error,
+    is_send_failure_dead,
+    mark_dead_and_remove,
+    mark_send_blocked,
+)
 from infra.db import run_db
-from repositories import account_repo, send_log_repo
+from repositories import send_log_repo
 
 logger = logging.getLogger(__name__)
 
@@ -49,19 +54,25 @@ async def _log_send(
         logger.warning("[发送日志] 落库失败 phone=%s chat=%s: %s", phone, chat_id, exc)
 
 
-async def _mark_dead_and_remove(phone: str, exc: BaseException) -> None:
-    """死号类异常统一处理:标 is_dead=1 + 移出 client 池。失败仅记日志。"""
-    err_code = type(exc).__name__
-    try:
-        affected = await run_db(account_repo.mark_dead, phone, err_code, str(exc))
-        if affected:
-            logger.warning("[死号] phone=%s 已标记失效 reason=%s", phone, err_code)
-    except Exception as e2:
-        logger.warning("[死号] 标记失败 phone=%s: %s", phone, e2)
-    try:
-        await client_manager.remove(phone)
-    except Exception as e2:
-        logger.warning("[死号] 移出 client 池失败 phone=%s: %s", phone, e2)
+async def _handle_send_failure(phone: str, chat_id: int, exc: BaseException) -> str:
+    """发送失败统一收口:终态死号 / 发不出死号 / 其余失败,返回给调用方的中文 reason。
+
+    两个失败出口(首发失败、FloodWait 退避后再失败)共用,避免判死逻辑各写一份(铁律:禁止重复)。
+    - 终态 session 失效:走 mark_dead_and_remove(标准死号)。
+    - 真走到 send_message 还失败且非临时类:走 mark_send_blocked(「能登录但发不出」死号,
+      对齐运营口径「号在跑定时/群聊时发失败就判死」)。
+    - 其余(限流/TG 故障/超时等临时类):只记日志,不判死,留重试余地。
+    """
+    if is_dead_error(exc):
+        logger.error("[发送] phone=%s chat=%s 死号异常: %s", phone, chat_id, exc)
+        await mark_dead_and_remove(phone, exc)
+        return f"账号已失效({type(exc).__name__})"
+    if is_send_failure_dead(exc):
+        logger.error("[发送] phone=%s chat=%s 发送失败判死(发不出): %s", phone, chat_id, exc)
+        await mark_send_blocked(phone, f"发送失败:{type(exc).__name__} {td_error.translate(exc)}")
+        return f"账号已失效(发不出消息:{type(exc).__name__})"
+    logger.error("[发送] phone=%s chat=%s 失败: %s", phone, chat_id, exc)
+    return td_error.translate(exc)
 
 
 async def send_text(
@@ -117,19 +128,9 @@ async def send_text(
             await _log_send(phone, chat_id, source, ok=False,
                             err_code=type(exc2).__name__, err_message=td_error.translate(exc2),
                             content_preview=preview)
-            if is_dead_error(exc2):
-                logger.error("[发送] phone=%s chat=%s 退避后死号异常: %s", phone, chat_id, exc2)
-                await _mark_dead_and_remove(phone, exc2)
-                return False, f"账号已失效({type(exc2).__name__})"
-            logger.error("[发送] phone=%s chat=%s 退避后仍失败: %s", phone, chat_id, exc2)
-            return False, td_error.translate(exc2)
+            return False, await _handle_send_failure(phone, chat_id, exc2)
     except Exception as exc:
         await _log_send(phone, chat_id, source, ok=False,
                         err_code=type(exc).__name__, err_message=td_error.translate(exc),
                         content_preview=preview)
-        if is_dead_error(exc):
-            logger.error("[发送] phone=%s chat=%s 死号异常: %s", phone, chat_id, exc)
-            await _mark_dead_and_remove(phone, exc)
-            return False, f"账号已失效({type(exc).__name__})"
-        logger.error("[发送] phone=%s chat=%s 失败: %s", phone, chat_id, exc)
-        return False, td_error.translate(exc)
+        return False, await _handle_send_failure(phone, chat_id, exc)

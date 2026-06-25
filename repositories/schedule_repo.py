@@ -56,6 +56,16 @@ def upsert_start(phone: str, chat_ids: str, content: str, interval_min: int) -> 
             cur.execute(sql, (phone, chat_ids, content, interval_min, now, now))
 
 
+def update_chat_ids(phone: str, chat_ids: str) -> None:
+    """覆盖某号定时任务的目标群列表(逗号分隔)。供发送失败时把发不出的群剔除。"""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE t_schedule_task SET chat_ids=%s, update_time=%s WHERE phone=%s",
+                (chat_ids, datetime.now(), phone),
+            )
+
+
 def update_status(phone: str, status: int) -> None:
     with get_connection() as conn:
         with conn.cursor() as cur:

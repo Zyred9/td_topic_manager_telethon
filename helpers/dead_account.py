@@ -2,7 +2,8 @@
 
 「死号」= session 被作废 / 账号被封 / authkey 失效等**不可恢复终态**,需运营在
 死号列表里复活(重登)或彻底删除。判定口径必须全项目统一,故收口到此处,
-message_sender(发送链路)与 account_watch_service(巡检链路)共用,不得各写一份。
+发送链路(message_sender)/巡检链路(get_me 探活)/启动全起等共用,不得各写一份。
+注:普通「发送失败」(被群封/被禁言/限流等)不判死,由调用方各自处理(如定时任务停该群)。
 
 口径(Telethon 1.43.2 实测类继承关系):
 - errors.UnauthorizedError 基类:一网打尽 AuthKeyUnregistered / AuthKeyInvalid /
@@ -30,11 +31,6 @@ _EXTRA_DEAD_ERRORS: tuple[type[BaseException], ...] = (
     errors.PhoneNumberBannedError,
 )
 
-# 「发送受限」死号的 err_code:号能登录(get_me 成功)但持续发不出消息(双向/被限制/被禁言)。
-# 不是 Telethon 异常类名,是巡检按发送日志统计判出来的,用独立 code 让运营在死号列表
-# 一眼区分「登录都登不上的真死号」与「能登录但发不出的受限号」。
-SEND_BLOCKED_CODE = "SEND_BLOCKED"
-
 
 def is_dead_error(exc: BaseException) -> bool:
     """判断异常是否代表小号已进入不可恢复终态(死号)。
@@ -47,21 +43,6 @@ def is_dead_error(exc: BaseException) -> bool:
     if isinstance(exc, errors.UnauthorizedError):
         return True
     return isinstance(exc, _EXTRA_DEAD_ERRORS)
-
-
-def is_send_failure_dead(exc: BaseException) -> bool:
-    """真实发送链路失败时,是否按「能登录但发不出」判死号(运营口径)。
-
-    口径(运营明确要求全拦):号已绑定定时/群聊自动发言,真走到 client.send_message 还失败,
-    无论什么异常(群封 UserBannedInChannel / 双向限制 PeerFlood / 被禁言 ChatWriteForbidden /
-    限流 FloodWait / 超时 / TG 故障 / 未知异常)一律判死号、出池、不再使用。
-
-    终态 session 失效(封号/作废)另由 is_dead_error 先行处理(标准死号),不重复进这里。
-
-    注:限流/超时/TG 故障可能是临时的,本口径也判死,会误杀好号 —— 这是运营明确选择的取舍
-    (宁可错杀、发失败就停用),需要时运营在死号列表里手动复活。
-    """
-    return not is_dead_error(exc)
 
 
 async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
@@ -77,15 +58,6 @@ async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
     模块级 import 会形成循环,放函数内规避。
     """
     return await _mark_and_remove(phone, type(exc).__name__, str(exc))
-
-
-async def mark_send_blocked(phone: str, desc: str) -> bool:
-    """标「发送受限」死号:号能登录但持续发不出消息(双向/被限制/被禁言)。
-
-    与 mark_dead_and_remove 共用落库+出池实现,只是 err_code 用语义化的
-    SEND_BLOCKED_CODE(非 Telethon 异常类名),让运营在死号列表里能区分两类死法。
-    """
-    return await _mark_and_remove(phone, SEND_BLOCKED_CODE, desc)
 
 
 async def _mark_and_remove(phone: str, err_code: str, err_desc: str) -> bool:

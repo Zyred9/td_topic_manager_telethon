@@ -20,9 +20,9 @@ from typing import Dict, Optional
 from config.constants import AccountStatus
 from config.settings import get_settings
 from core.client_manager import client_manager
-from helpers.dead_account import is_dead_error, mark_dead_and_remove, mark_send_blocked
+from helpers.dead_account import is_dead_error, mark_dead_and_remove
 from infra.db import run_db
-from repositories import account_repo, send_log_repo
+from repositories import account_repo
 
 logger = logging.getLogger(__name__)
 
@@ -110,25 +110,6 @@ async def _check_one(phone: str) -> None:
     # 探活成功:清零失败计数,同步实时资料(问题5)
     _clear_streak(phone)
     await _sync_profile(phone, me)
-    # 号能登录 ≠ 能发消息:再查发送日志,持续发不出(双向/被限制)也判死号
-    await _check_send_health(phone)
-
-
-async def _check_send_health(phone: str) -> None:
-    """发送受限检测:号 get_me() 成功(活着)但近期持续发不出消息时判「发送受限」死号。
-
-    判据:近 window 小时内失败数 ≥ 阈值 且 零成功 —— 偶发失败(网络抖动/单次 FloodWait)
-    不会触发;只有「一直发不出去」才判,避免误杀。统计已排除 NOT_READY/QUOTA_FULL 这类
-    没真发出去的本地拦截。零成功是关键:只要这窗口内还有一条发成功,就说明号能发,不判死。
-    """
-    wcfg = get_settings().watch
-    fail, ok = await run_db(
-        send_log_repo.count_results_since, phone, wcfg.send_fail_window_hours,
-    )
-    if fail >= wcfg.send_fail_threshold and ok == 0:
-        desc = f"近 {wcfg.send_fail_window_hours}h 发送失败 {fail} 次且无一成功,疑似双向/被限制"
-        logger.warning("[死号] phone=%s 发送受限判死: %s", phone, desc)
-        await mark_send_blocked(phone, desc)
 
 
 async def _sync_profile(phone: str, me) -> None:
@@ -171,22 +152,6 @@ async def _watch_tick() -> None:
         except Exception as exc:
             logger.warning("巡检单号异常,跳过 phone=%s", phone, exc_info=exc)
         await asyncio.sleep(random.uniform(_JITTER_MIN_SEC, _JITTER_MAX_SEC))
-
-
-async def scan_dead_on_startup() -> None:
-    """启动扫描:把历史发送日志里「最近连续失败 ≥ 阈值」的号一次性判死,搬进死号列表。
-
-    解决被动检测的盲区:号上次运行时就一直发不出去(连续失败),但重启后还没被派去发,
-    当前各链路都不会再去碰它,死号永远标不上。启动时扫一遍历史日志补上。
-    mark_send_blocked 幂等(WHERE is_dead=0),已是死号的不会重复标。
-    """
-    streak = get_settings().watch.startup_fail_streak
-    phones = await run_db(send_log_repo.phones_with_consecutive_send_fails, streak)
-    if not phones:
-        return
-    logger.info("启动扫描:%d 个号最近连续发送失败 ≥ %d 次,判死", len(phones), streak)
-    for phone in phones:
-        await mark_send_blocked(phone, f"启动扫描:历史最近连续发送失败 ≥ {streak} 次")
 
 
 async def _watch_loop() -> None:

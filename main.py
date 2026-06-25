@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -60,26 +61,42 @@ async def lifespan(app: FastAPI):
     from services import dm_service
     dm_service.register()
 
-    # 启动扫描:历史发送日志里最近连续失败的号先判死,避免它们被全起进池继续发
-    from services import account_watch_service
-    await account_watch_service.scan_dead_on_startup()
-
-    logger.info("启动 ClientManager 全起已登录小号...")
+    # 小号全起放后台:全起是串行连接、每号最多 15s,几十上百个号会阻塞 lifespan 几分钟,
+    # 期间 uvicorn 还没开始收请求 → web 全部 502/超时。改成后台任务异步连,服务立即可用,
+    # 小号慢慢进池;还没连上的号被请求用到时,get_ready_client 返回 None 走「小号未就绪」提示。
     from core.client_manager import client_manager
-    await client_manager.startup()
 
-    # 启动话题自驱调度器(话题需运营手动 start 才会真正发言)
-    topic_scheduler.start_scheduler()
+    async def _background_startup() -> None:
+        try:
+            logger.info("后台全起已登录小号(不阻塞 web)...")
+            await client_manager.startup()
+            # 全起完再启动话题自驱(否则池里还没号,自驱空跑)
+            topic_scheduler.start_scheduler()
+            logger.info("后台全起完成,话题自驱已启动")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("后台全起异常")
 
-    # 启动小号健康巡检(周期检测在线/授权状态 + 同步实时资料)
+    startup_task = asyncio.create_task(_background_startup())
+
+    # 巡检不依赖全起完成(它自己遍历池内号),可立即启动
     from services import account_watch_service
     account_watch_service.start_watch()
 
     logger.info("=" * 50)
-    logger.info("服务启动完成,根路径 %s,端口 %s", settings.server.root_path, settings.server.port)
+    logger.info("服务启动完成(小号后台加载中),根路径 %s,端口 %s",
+                settings.server.root_path, settings.server.port)
     logger.info("=" * 50)
 
     yield
+
+    # 关闭:先停后台全起任务(可能还在连号)
+    startup_task.cancel()
+    try:
+        await startup_task
+    except (asyncio.CancelledError, Exception):
+        pass
 
     # 关闭:停调度器 + 巡检 + 定时发送 + 后台任务 + 断开所有 client
     from core.client_manager import client_manager

@@ -92,10 +92,28 @@ async def _cancel_task(phone: str) -> None:
 
 async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min: int) -> None:
     interval_sec = interval_min * 60
+    # 本地可变副本:某群发失败就从这里剔除(发不出是群级问题,不连累整号/其他群)。
+    targets = list(chat_ids)
     try:
         while True:
-            for chat_id in chat_ids:
-                await message_sender.send_text(phone, chat_id, content, source=SendSource.SCHEDULE)
+            for chat_id in list(targets):  # 遍历副本,循环内可安全删 targets
+                ok, reason = await message_sender.send_text(
+                    phone, chat_id, content, source=SendSource.SCHEDULE,
+                )
+                if not ok:
+                    # 发不出该群:剔除并落库,号继续发其余群。号本身已失效的由
+                    # message_sender 内部判死出池,这里不重复处理。
+                    targets.remove(chat_id)
+                    await run_db(schedule_repo.update_chat_ids,
+                                 phone, ",".join(str(c) for c in targets))
+                    logger.warning("[定时] phone=%s 群 %s 发送失败,已移出该群:%s",
+                                   phone, chat_id, reason)
+                    if not targets:
+                        # 一个群都不剩:停整个任务,避免空转
+                        await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
+                        _tasks.pop(phone, None)
+                        logger.warning("[定时] phone=%s 所有群均发送失败,定时任务已停止", phone)
+                        return
                 await asyncio.sleep(random.uniform(2, 3))  # 群间抖动
             await run_db(schedule_repo.mark_sent, phone)
             await asyncio.sleep(interval_sec)

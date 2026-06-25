@@ -115,13 +115,6 @@ class WatchConfig:
     """小号健康巡检参数:周期检测在线/授权状态并同步实时资料。"""
 
     interval_min: int
-    # 发送健康(双向/被限制检测):号能登录(get_me 成功)但持续发不出消息时,
-    # 巡检统计近 send_fail_window_hours 小时内的发送结果,失败数 ≥ send_fail_threshold
-    # 且这窗口内零成功 → 判「发送受限」死号(语义见 dead_account.SEND_BLOCKED_CODE)。
-    send_fail_window_hours: int
-    send_fail_threshold: int
-    # 启动扫描:历史发送日志里「最近连续失败 ≥ startup_fail_streak 次」的号判死,补被动检测盲区。
-    startup_fail_streak: int
 
 
 @dataclass(frozen=True)
@@ -220,9 +213,6 @@ def get_settings() -> Settings:
         ),
         watch=WatchConfig(
             interval_min=_get_int("ACCOUNT_WATCH_INTERVAL_MIN", 15),
-            send_fail_window_hours=_get_int("ACCOUNT_SEND_FAIL_WINDOW_HOURS", 6),
-            send_fail_threshold=_get_int("ACCOUNT_SEND_FAIL_THRESHOLD", 10),
-            startup_fail_streak=_get_int("ACCOUNT_STARTUP_FAIL_STREAK", 3),
         ),
         proxy=ProxyConfig(
             host=os.getenv("TD_PROXY_HOST") or None,

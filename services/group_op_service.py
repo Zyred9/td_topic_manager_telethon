@@ -18,12 +18,7 @@ from config.settings import get_settings
 from core.batch_store import ITEM_FAILED, ITEM_SUCCESS, batch_store
 from core.client_manager import client_manager
 from helpers import link_parser, td_error
-from helpers.dead_account import (
-    is_dead_error,
-    is_send_failure_dead,
-    mark_dead_and_remove,
-    mark_send_blocked,
-)
+from helpers.dead_account import is_dead_error, mark_dead_and_remove
 from infra.db import run_db
 from repositories import account_watch_repo
 
@@ -122,12 +117,9 @@ async def run_broadcast(phones: List[str], chat_id: int, content: str, batch_id:
             logger.warning("[群发] %s 失败 群=%s 异常类型=%s 异常=%s",
                            phone, chat_id, type(exc).__name__, exc)
             logger.debug("[群发] %s 失败堆栈", phone, exc_info=True)
-            # 群发是真发消息:终态失效→标准死号;非临时类发不出→「发不出」死号(对齐发送链路口径)
+            # 终态失效(封号/作废)才判死;其余发送失败(被群封/被禁言等)不判死,仅记失败原因
             if is_dead_error(exc):
                 await mark_dead_and_remove(phone, exc)
-            elif is_send_failure_dead(exc):
-                logger.warning("[群发] %s 发送失败判死(发不出) 群=%s: %s", phone, chat_id, type(exc).__name__)
-                await mark_send_blocked(phone, f"群发失败:{type(exc).__name__} {td_error.translate(exc)}")
     batch_store.finish(batch_id)
 
 

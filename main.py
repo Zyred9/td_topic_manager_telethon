@@ -60,6 +60,10 @@ async def lifespan(app: FastAPI):
     from services import dm_service
     dm_service.register()
 
+    # 启动扫描:历史发送日志里最近连续失败的号先判死,避免它们被全起进池继续发
+    from services import account_watch_service
+    await account_watch_service.scan_dead_on_startup()
+
     logger.info("启动 ClientManager 全起已登录小号...")
     from core.client_manager import client_manager
     await client_manager.startup()

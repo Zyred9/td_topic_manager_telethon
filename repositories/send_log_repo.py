@@ -61,6 +61,37 @@ def count_results_since(phone: str, hours: int) -> Tuple[int, int]:
     return int(row.get("fail") or 0), int(row.get("ok_cnt") or 0)
 
 
+def phones_with_consecutive_send_fails(min_streak: int) -> List[str]:
+    """找出「最近连续发送失败 ≥ min_streak 次」的号,供启动扫描判死。
+
+    连续口径:号的最后一条成功之后(没成功过则从头)的失败条数 ≥ min_streak。
+    等价于按时间倒序最近 min_streak 条全是失败。只算真走到 send_message 的失败,
+    排除 NOT_READY/QUOTA_FULL 这类本地拦截(还没真发出去,不代表号发不出)。
+
+    用 last_ok(该号最后一次成功时间)当分界:统计 send_time > last_ok 的失败数。
+    没成功过的号 last_ok 为 NULL,用 '1970-01-01' 兜底使其全部失败计入。
+    """
+    sql = (
+        "SELECT f.phone "
+        "FROM ("
+        "  SELECT phone, "
+        "         COALESCE(MAX(CASE WHEN ok=1 THEN send_time END), '1970-01-01') AS last_ok "
+        "  FROM t_send_log GROUP BY phone"
+        ") f "
+        "JOIN t_send_log l ON l.phone = f.phone "
+        "  AND l.ok = 0 "
+        "  AND l.err_code NOT IN ('NOT_READY','QUOTA_FULL') "
+        "  AND l.send_time > f.last_ok "
+        "GROUP BY f.phone "
+        "HAVING COUNT(*) >= %s"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (int(min_streak),))
+            rows = cur.fetchall()
+    return [r["phone"] for r in rows]
+
+
 def page_by_phone(
     phone: str, page_no: int, size: int,
     only_failed: bool = False, hours: Optional[int] = None,

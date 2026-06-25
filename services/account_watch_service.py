@@ -173,6 +173,22 @@ async def _watch_tick() -> None:
         await asyncio.sleep(random.uniform(_JITTER_MIN_SEC, _JITTER_MAX_SEC))
 
 
+async def scan_dead_on_startup() -> None:
+    """启动扫描:把历史发送日志里「最近连续失败 ≥ 阈值」的号一次性判死,搬进死号列表。
+
+    解决被动检测的盲区:号上次运行时就一直发不出去(连续失败),但重启后还没被派去发,
+    当前各链路都不会再去碰它,死号永远标不上。启动时扫一遍历史日志补上。
+    mark_send_blocked 幂等(WHERE is_dead=0),已是死号的不会重复标。
+    """
+    streak = get_settings().watch.startup_fail_streak
+    phones = await run_db(send_log_repo.phones_with_consecutive_send_fails, streak)
+    if not phones:
+        return
+    logger.info("启动扫描:%d 个号最近连续发送失败 ≥ %d 次,判死", len(phones), streak)
+    for phone in phones:
+        await mark_send_blocked(phone, f"启动扫描:历史最近连续发送失败 ≥ {streak} 次")
+
+
 async def _watch_loop() -> None:
     interval_sec = get_settings().watch.interval_min * 60
     while True:

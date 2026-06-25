@@ -20,9 +20,9 @@ from typing import Dict, Optional
 from config.constants import AccountStatus
 from config.settings import get_settings
 from core.client_manager import client_manager
-from helpers.dead_account import is_dead_error, mark_dead_and_remove
+from helpers.dead_account import is_dead_error, mark_dead_and_remove, mark_dead_by_reason
 from infra.db import run_db
-from repositories import account_repo
+from repositories import account_repo, send_log_repo
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +135,25 @@ async def _sync_profile(phone: str, me) -> None:
         logger.info(
             "巡检同步资料 phone=%s 昵称 %r->%r 用户名 %r->%r",
             phone, acc.tg_first_name, new_first, acc.tg_username, new_username,
+        )
+
+
+async def scan_dead_on_startup() -> None:
+    """启动扫描:把 t_send_log 里累计「被群封」≥ 阈值的号一次性判死搬进死号列表。
+
+    补「死号列表为空」的根因:实时判死只在发送那一刻生效,历史日志里已有的 UserBanned
+    失败无人回看 → 死号永远标不上。启动时按发送日志统计一次补判死。口径与实时一致:
+    只数 UserBannedInChannelError,不误杀被禁言/限流的号。mark_dead_by_reason 幂等。
+    """
+    threshold = get_settings().watch.startup_fail_count
+    phones = await run_db(send_log_repo.phones_with_banned_count_at_least, threshold)
+    if not phones:
+        logger.info("启动扫描:无累计被群封 ≥ %d 次的号", threshold)
+        return
+    logger.info("启动扫描:%d 个号累计被群封 ≥ %d 次,判死", len(phones), threshold)
+    for phone in phones:
+        await mark_dead_by_reason(
+            phone, "UserBannedInChannelError", f"启动扫描:累计被群封 ≥ {threshold} 次",
         )
 
 

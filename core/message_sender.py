@@ -23,7 +23,7 @@ from config.constants import SendSource
 from core.client_manager import client_manager
 from core.throttle import throttle
 from helpers import td_error
-from helpers.dead_account import is_dead_error, mark_dead_and_remove
+from helpers.dead_account import is_send_dead_error, mark_dead_and_remove
 from infra.db import run_db
 from repositories import send_log_repo
 
@@ -53,12 +53,13 @@ async def _handle_send_failure(phone: str, chat_id: int, exc: BaseException) -> 
     """发送失败统一收口,返回给调用方的中文 reason。
 
     两个失败出口(首发失败、FloodWait 退避后再失败)共用,避免判死逻辑各写一份(铁律:禁止重复)。
-    - 终态 session 失效(封号/作废):走 mark_dead_and_remove 判死出池(标准死号)。
-    - 其余一切发送失败(被群封/被禁言/双向/限流/超时等):只记日志、不判死号。
-      发不出某个群是「群级问题」,由调用方(定时任务)自行决定停该群,不连累整号。
+    - 判死类异常(终态 session 失效 / UserBannedInChannel 被群永久封):mark_dead_and_remove
+      判死出池,进死号列表。
+    - 其余一切发送失败(被禁言/限流/超时等):只记日志、不判死号。发不出某个群是「群级问题」,
+      由调用方(定时任务)自行决定停该群,不连累整号。
     """
-    if is_dead_error(exc):
-        logger.error("[发送] phone=%s chat=%s 死号异常: %s", phone, chat_id, exc)
+    if is_send_dead_error(exc):
+        logger.error("[发送] phone=%s chat=%s 判死异常: %s", phone, chat_id, exc)
         await mark_dead_and_remove(phone, exc)
         return f"账号已失效({type(exc).__name__})"
     logger.error("[发送] phone=%s chat=%s 失败: %s", phone, chat_id, exc)

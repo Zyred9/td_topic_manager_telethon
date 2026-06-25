@@ -91,6 +91,8 @@ async def _cancel_task(phone: str) -> None:
 
 
 async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min: int) -> None:
+    from core.client_manager import client_manager
+
     interval_sec = interval_min * 60
     # 本地可变副本:某群发失败就从这里剔除(发不出是群级问题,不连累整号/其他群)。
     targets = list(chat_ids)
@@ -101,8 +103,14 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
                     phone, chat_id, content, source=SendSource.SCHEDULE,
                 )
                 if not ok:
-                    # 发不出该群:剔除并落库,号继续发其余群。号本身已失效的由
-                    # message_sender 内部判死出池,这里不重复处理。
+                    # 号被判死(UserBanned/终态失效)会被 message_sender 出池:此时整号已不可用,
+                    # 直接停整个定时任务,别再逐群剔除刷屏。
+                    if client_manager.get_ready_client(phone) is None:
+                        await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
+                        _tasks.pop(phone, None)
+                        logger.warning("[定时] phone=%s 已不可用(判死/掉线),定时任务停止:%s", phone, reason)
+                        return
+                    # 号还在,只是这个群发不出:剔除该群并落库,号继续发其余群。
                     targets.remove(chat_id)
                     await run_db(schedule_repo.update_chat_ids,
                                  phone, ",".join(str(c) for c in targets))

@@ -65,9 +65,13 @@ async def lifespan(app: FastAPI):
     # 期间 uvicorn 还没开始收请求 → web 全部 502/超时。改成后台任务异步连,服务立即可用,
     # 小号慢慢进池;还没连上的号被请求用到时,get_ready_client 返回 None 走「小号未就绪」提示。
     from core.client_manager import client_manager
+    from services import account_watch_service
 
     async def _background_startup() -> None:
         try:
+            # 先按发送日志统计补判死(累计失败 ≥ 阈值):这些号判死后 find_by_statuses
+            # 过滤 is_dead=0,不会被全起进池。补「死号列表为空」的根因。
+            await account_watch_service.scan_dead_on_startup()
             logger.info("后台全起已登录小号(不阻塞 web)...")
             await client_manager.startup()
             # 全起完再启动话题自驱(否则池里还没号,自驱空跑)
@@ -81,7 +85,6 @@ async def lifespan(app: FastAPI):
     startup_task = asyncio.create_task(_background_startup())
 
     # 巡检不依赖全起完成(它自己遍历池内号),可立即启动
-    from services import account_watch_service
     account_watch_service.start_watch()
 
     logger.info("=" * 50)

@@ -45,6 +45,20 @@ def is_dead_error(exc: BaseException) -> bool:
     return isinstance(exc, _EXTRA_DEAD_ERRORS)
 
 
+def is_send_dead_error(exc: BaseException) -> bool:
+    """发送链路失败时,该异常是否要判死整号(出池、进死号列表)。
+
+    口径(运营锁定):
+    - 终态 session 失效(is_dead_error:封号/作废)→ 判死。
+    - UserBannedInChannelError(被该群永久封禁)→ 判死。运营要求这类进死号列表。
+    其余一切失败(被禁言 ChatWriteForbidden / 限流 / 超时 / 群私有等)返回 False,
+    不判死号 —— 由调用方(定时任务)按「只停该群」处理,不连累整号。
+    """
+    if is_dead_error(exc):
+        return True
+    return isinstance(exc, errors.UserBannedInChannelError)
+
+
 async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
     """死号统一落库口径(全项目唯一实现):标 is_dead=1 + 移出 client 池。
 
@@ -58,6 +72,15 @@ async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
     模块级 import 会形成循环,放函数内规避。
     """
     return await _mark_and_remove(phone, type(exc).__name__, str(exc))
+
+
+async def mark_dead_by_reason(phone: str, err_code: str, err_desc: str) -> bool:
+    """无异常对象时的判死入口(如启动扫描按发送日志统计判死)。
+
+    与 mark_dead_and_remove 共用唯一落库+出池实现,只是 reason 由调用方按业务语义给,
+    不是从异常派生。幂等(WHERE is_dead=0)。
+    """
+    return await _mark_and_remove(phone, err_code, err_desc)
 
 
 async def _mark_and_remove(phone: str, err_code: str, err_desc: str) -> bool:

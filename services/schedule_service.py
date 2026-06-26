@@ -98,6 +98,7 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
     targets = list(chat_ids)
     try:
         while True:
+            await asyncio.sleep(interval_sec)  # 启动后先等一个间隔再发,第 0 秒不发送
             for chat_id in list(targets):  # 遍历副本,循环内可安全删 targets
                 ok, reason = await message_sender.send_text(
                     phone, chat_id, content, source=SendSource.SCHEDULE,

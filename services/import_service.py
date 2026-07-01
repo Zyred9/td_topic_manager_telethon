@@ -36,6 +36,7 @@ from config.settings import get_settings
 from core import update_router  # noqa: F401
 from core.batch_store import ITEM_FAILED, ITEM_SUCCESS, batch_store
 from core.client_manager import client_manager
+from helpers.dead_account import is_dead_error
 from infra import telethon_factory
 from infra.db import run_db
 from repositories import account_repo
@@ -204,10 +205,12 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
             batch_store.set_item(batch_id, phone, ITEM_SUCCESS, note="已登录")
             logger.info("[导入] %s 登录成功", phone)
         else:
-            # session 失效,需走手机号补登
-            await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+            # session 已失效(authkey 不被服务端承认):协议号无法靠验证码重登,该号已无用
+            # → 判死进死号列表(对齐 client_manager._connect_account 启动口径)。
+            await run_db(account_repo.mark_dead, phone,
+                         "SessionInvalid", "导入校验时 session 已失效(未授权)")
             batch_store.set_item(batch_id, phone, ITEM_FAILED,
-                                 fail_reason="会话已失效,请改走手机号登录")
+                                 fail_reason="会话已失效,已判为死号(可在死号列表复活或删除)")
     except errors.FloodWaitError as exc:
         await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
         batch_store.set_item(batch_id, phone, ITEM_FAILED,
@@ -222,12 +225,19 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
             batch_id, phone, ITEM_FAILED,
             fail_reason="session 格式与当前 Telethon 版本不兼容,请升级服务端 telethon 或改手机号登录",
         )
-    except Exception:
+    except Exception as exc:
         # 任何其它异常(连接错误/RPC 错误)也要标记失败,避免 client 泄漏。
-        # 记完整堆栈便于排查,但不向上抛(已写明细),避免上层用英文异常覆盖中文 reason。
-        logger.exception("[导入] %s 连接校验异常", phone)
-        await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
-        batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason="连接校验失败,请改走手机号登录")
+        if is_dead_error(exc):
+            # 终态死号异常(session 作废/封号/多 IP 撞车)→ 判死进死号列表。
+            logger.warning("[导入] %s 连接校验死号异常 reason=%s", phone, type(exc).__name__)
+            await run_db(account_repo.mark_dead, phone, type(exc).__name__, str(exc))
+            batch_store.set_item(batch_id, phone, ITEM_FAILED,
+                                 fail_reason=f"账号已失效({type(exc).__name__}),已判为死号")
+        else:
+            # 非终态:记完整堆栈便于排查,降级为需重登,不向上抛(避免英文异常覆盖中文 reason)。
+            logger.exception("[导入] %s 连接校验异常", phone)
+            await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason="连接校验失败,请改走手机号登录")
     finally:
         # 未进池的 client 一律断开,防 TCP 连接与读循环泄漏
         if not registered:

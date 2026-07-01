@@ -125,7 +125,6 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
                         return
                 await asyncio.sleep(random.uniform(2, 3))  # 群间抖动
             await run_db(schedule_repo.mark_sent, phone)
-            await asyncio.sleep(interval_sec)
     except asyncio.CancelledError:
         raise
     except Exception:

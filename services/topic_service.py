@@ -15,6 +15,7 @@ from telethon.tl.tlobject import TLRequest
 from config.constants import TaskStatus
 from core.client_manager import client_manager
 from helpers import td_error
+from helpers.dead_account import is_dead_error, mark_dead_and_remove
 from infra.db import run_db
 from repositories import account_watch_repo, topic_member_repo, topic_repo
 from services import ai_chat_engine
@@ -261,6 +262,11 @@ async def transfer_owner(topic_id: int, new_owner_phone: str, password: str) -> 
     except errors.PasswordHashInvalidError as exc:
         raise TopicError("当前群主的 2FA 密码错误") from exc
     except Exception as exc:
+        # 终态死号异常 → 判死。绝大多数 RPC 由 owner_client 发起(get_input_entity /
+        # EditCreator / make_password),仅 get_me 走 new_client;无法从单个异常精确定位
+        # 来源,故只对主操作方 owner 判死,避免盲标两个号误杀好的新群主号。
+        if is_dead_error(exc):
+            await mark_dead_and_remove(row["owner_phone"], exc)
         raise TopicError(f"移交群主失败: {td_error.translate(exc)}") from exc
     await run_db(topic_repo.update_owner, topic_id, new_owner_phone)
     logger.info("话题 id=%s 群主移交 %s -> %s", topic_id, row["owner_phone"], new_owner_phone)

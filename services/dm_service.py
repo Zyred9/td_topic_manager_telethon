@@ -15,6 +15,7 @@ from config.constants import DM_MEDIA_MAX_BYTES
 from config.settings import get_settings
 from core import update_router
 from core.client_manager import client_manager
+from helpers.dead_account import is_dead_error, mark_dead_and_remove
 from helpers.time_format import to_cn_str
 from infra.db import run_db
 from repositories import dm_repo
@@ -127,6 +128,9 @@ async def _maybe_download(phone: str, sender_id: int, message, msg_type: str):
         return rel, actual, None
     except Exception as exc:
         logger.warning("[私聊] 媒体下载失败 phone=%s: %s", phone, exc)
+        # 下载 RPC 抛终态死号异常 → 判死进死号列表 + 出池(对齐全项目口径)
+        if is_dead_error(exc):
+            await mark_dead_and_remove(phone, exc)
         return None, size, "下载异常"
 
 

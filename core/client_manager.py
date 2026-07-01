@@ -17,6 +17,7 @@ from telethon import TelegramClient, errors, events
 
 from config.constants import AccountStatus
 from core import update_router
+from helpers.dead_account import is_dead_error
 from infra import telethon_factory
 from infra.db import run_db
 from repositories import account_repo
@@ -54,8 +55,11 @@ class ClientManager:
         """服务启动:重置遗留状态,再把"已登录(3)"和"需重新登录(5)"的号都试连。
 
         协议号 session 是已登录态凭证,connect 即生效不需验证码,所以状态 5 的号
-        若只是上次临时连接失败被误标,本次能连上就自动恢复成状态 3;真正失效/被
-        作废的维持 5,等运营人工重新导入。
+        若只是上次临时连接失败被误标,本次能连上就自动恢复成状态 3。
+        连接结果分三类:
+          - session 已失效/被作废(未授权 / AuthKeyDuplicated):终态无用 → 判死进死号列表;
+          - 超时 / 其它未知异常:可能临时故障 → 维持 NEED_RELOGIN(5)留主列表,下次再试;
+          - 连上且已授权:恢复为已登录(3)。
         """
         await run_db(account_repo.reset_all_status_on_startup)
         accounts = await run_db(
@@ -69,17 +73,25 @@ class ClientManager:
             except asyncio.TimeoutError:
                 logger.warning("全起小号超时(%.0fs),跳过 phone=%s", self._CONNECT_TIMEOUT, acc.phone)
                 await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
-            except errors.AuthKeyDuplicatedError:
-                # session 在多个 IP 同时使用被 TG 作废,是明确终态(需重新登录),
-                # 不是程序异常,记清晰 WARNING 不刷堆栈,继续起其它号。
+            except errors.AuthKeyDuplicatedError as exc:
+                # session 在多个 IP 同时使用被 TG 作废,是明确终态失效、无法恢复,
+                # 该号对运营已无用 → 判死进死号列表(不是临时故障,不刷堆栈)。
                 logger.warning(
-                    "小号 %s 的 session 已被 Telegram 作废(同一 session 在多个 IP 使用),"
-                    "需重新登录获取新 session", acc.phone,
+                    "小号 %s 的 session 已被 Telegram 作废(同一 session 在多个 IP 使用),判定死号",
+                    acc.phone,
                 )
-                await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
-            except Exception:
-                logger.exception("全起小号失败 phone=%s", acc.phone)
-                await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
+                await run_db(account_repo.mark_dead, acc.phone,
+                             type(exc).__name__, "启动连接时 session 被作废(多 IP 撞车)")
+            except Exception as exc:
+                # connect()/get_me() 直接抛出的终态死号异常(UnauthorizedError 系等)会落到
+                # 这里:该号已不可恢复,判死进死号列表,不再降级为 NEED_RELOGIN 赖在主列表。
+                # (此时号尚未进池,直接 mark_dead 即可,无需出池。)
+                if is_dead_error(exc):
+                    logger.warning("全起小号死号异常 phone=%s reason=%s", acc.phone, type(exc).__name__)
+                    await run_db(account_repo.mark_dead, acc.phone, type(exc).__name__, str(exc))
+                else:
+                    logger.exception("全起小号失败 phone=%s", acc.phone)
+                    await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
 
     async def _connect_account(self, account) -> None:
         client = telethon_factory.build_client_for_account(account)
@@ -87,8 +99,12 @@ class ClientManager:
         try:
             await client.connect()
             if not await client.is_user_authorized():
-                logger.warning("小号 %s 会话已失效,需重新登录", account.phone)
-                await run_db(account_repo.update_status, account.phone, int(AccountStatus.NEED_RELOGIN))
+                # 启动全起时 session 已失效:authkey 不被服务端承认,该号对运营已无用
+                # (协议号无法靠验证码重登,手机号也需重新走登录流程)。直接判死进死号
+                # 列表,由运营复活或彻底删除,不再赖在主列表里反复点「重新登录」也救不活。
+                logger.warning("小号 %s 会话已失效,判定死号", account.phone)
+                await run_db(account_repo.mark_dead, account.phone,
+                             "SessionInvalid", "启动连接时 session 已失效(未授权)")
                 return
             me = await client.get_me()
             self._register_events(account.phone, client)

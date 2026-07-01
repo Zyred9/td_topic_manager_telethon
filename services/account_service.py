@@ -21,6 +21,7 @@ from config.settings import get_settings
 from core import message_sender  # noqa: F401  (确保 core 初始化顺序)
 from core.client_manager import client_manager
 from core.throttle import throttle
+from helpers.dead_account import is_dead_error, mark_dead_and_remove
 from infra import telethon_factory
 from infra.db import get_connection, run_db
 from repositories import account_repo, account_watch_repo, send_log_repo
@@ -233,6 +234,11 @@ async def submit_code(phone: str, code: str) -> None:
         raise AccountError("该账号开启了二级密码,请提交 2FA 密码", code=200)
     except (errors.PhoneCodeInvalidError, errors.PhoneCodeExpiredError) as exc:
         raise AccountError("验证码错误或已过期") from exc
+    except Exception as exc:
+        # 提交验证码时账号被封/停用/session 作废等终态 → 判死(上面可恢复错误已先排除)
+        if is_dead_error(exc):
+            raise await _login_mark_dead(phone, client, exc) from exc
+        raise
     await _finish_login(phone, client)
 
 
@@ -243,17 +249,45 @@ async def submit_2fa(phone: str, password: str) -> None:
     await _sign_in_2fa(phone, password)
 
 
+async def _login_mark_dead(phone: str, client: TelegramClient, exc: BaseException) -> AccountError:
+    """登录链路(未进池)遇终态死号异常的统一处理:标死 + 清登录态 + 断开未进池 client。
+
+    与运行时不同,登录阶段 client 尚未交给池,故不走 client_manager.remove,直接
+    mark_dead + 自行 disconnect。返回给调用方 raise 的 AccountError。
+    """
+    err_code = type(exc).__name__
+    logger.warning("登录链路判定死号 phone=%s reason=%s", phone, err_code, exc_info=exc)
+    await run_db(account_repo.mark_dead, phone, err_code, str(exc))
+    _pending_login.pop(phone, None)
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    return AccountError(f"账号已失效({err_code}),已移入死号列表")
+
+
 async def _sign_in_2fa(phone: str, password: str) -> None:
     client = _pending_login[phone][0]
     try:
         await client.sign_in(password=password)
     except errors.PasswordHashInvalidError as exc:
         raise AccountError("二级密码错误") from exc
+    except Exception as exc:
+        # 提交 2FA 时账号被封/停用/session 作废等终态 → 判死(PasswordHashInvalid 已先排除)
+        if is_dead_error(exc):
+            raise await _login_mark_dead(phone, client, exc) from exc
+        raise
     await _finish_login(phone, client)
 
 
 async def _finish_login(phone: str, client: TelegramClient) -> None:
-    me = await client.get_me()
+    try:
+        me = await client.get_me()
+    except Exception as exc:
+        # 登录收尾 get_me() 抛终态死号异常(概率低但可能):判死。me 为 None 不判死。
+        if is_dead_error(exc):
+            raise await _login_mark_dead(phone, client, exc) from exc
+        raise
     await client_manager.register_ready_client(phone, client)
     await run_db(
         account_repo.mark_logged_in,
@@ -291,6 +325,10 @@ async def update_profile(phone: str, first_name, last_name, username, bio) -> No
     except errors.FloodWaitError as exc:
         raise AccountError(f"操作频率过高,请等待 {exc.seconds} 秒") from exc
     except Exception as exc:
+        # 改资料时 get_me()/UpdateProfile RPC 抛终态死号异常 → 判死进死号列表 + 出池。
+        if is_dead_error(exc):
+            await mark_dead_and_remove(phone, exc)
+            raise AccountError(f"账号已失效({type(exc).__name__}),已移入死号列表") from exc
         raise AccountError(f"修改资料失败: {exc}") from exc
     await run_db(account_repo.update_profile, phone, first_name, last_name, username, bio)
     logger.info("修改资料 phone=%s", phone)

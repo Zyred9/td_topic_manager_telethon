@@ -266,7 +266,11 @@ async def transfer_owner(topic_id: int, new_owner_phone: str, password: str) -> 
         # EditCreator / make_password),仅 get_me 走 new_client;无法从单个异常精确定位
         # 来源,故只对主操作方 owner 判死,避免盲标两个号误杀好的新群主号。
         if is_dead_error(exc):
-            await mark_dead_and_remove(row["owner_phone"], exc)
+            await mark_dead_and_remove(
+                row["owner_phone"],
+                exc,
+                expected_client=owner_client,
+            )
         raise TopicError(f"移交群主失败: {td_error.translate(exc)}") from exc
     await run_db(topic_repo.update_owner, topic_id, new_owner_phone)
     logger.info("话题 id=%s 群主移交 %s -> %s", topic_id, row["owner_phone"], new_owner_phone)

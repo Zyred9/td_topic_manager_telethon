@@ -21,7 +21,7 @@ from config.settings import get_settings
 from core import message_sender  # noqa: F401  (确保 core 初始化顺序)
 from core.client_manager import client_manager
 from core.throttle import throttle
-from helpers.dead_account import is_dead_error, mark_dead_and_remove
+from helpers.dead_account import account_state_lock, is_dead_error, mark_dead_and_remove
 from infra import telethon_factory
 from infra.db import get_connection, run_db
 from repositories import account_repo, account_watch_repo, send_log_repo
@@ -252,12 +252,21 @@ async def submit_2fa(phone: str, password: str) -> None:
 async def _login_mark_dead(phone: str, client: TelegramClient, exc: BaseException) -> AccountError:
     """登录链路(未进池)遇终态死号异常的统一处理:标死 + 清登录态 + 断开未进池 client。
 
-    与运行时不同,登录阶段 client 尚未交给池,故不走 client_manager.remove,直接
-    mark_dead + 自行 disconnect。返回给调用方 raise 的 AccountError。
+    公共判死入口负责 pending 落库与幂等出池；本地未进池 client 仍需自行 disconnect。
+    返回给调用方 raise 的 AccountError。
     """
     err_code = type(exc).__name__
     logger.warning("登录链路判定死号 phone=%s reason=%s", phone, err_code, exc_info=exc)
-    await run_db(account_repo.mark_dead, phone, err_code, str(exc))
+    await mark_dead_and_remove(
+        phone,
+        exc,
+        expected_client=None,
+        expected_statuses=(
+            int(AccountStatus.INITIALIZING),
+            int(AccountStatus.WAIT_CODE),
+            int(AccountStatus.WAIT_2FA),
+        ),
+    )
     _pending_login.pop(phone, None)
     try:
         await client.disconnect()
@@ -288,15 +297,7 @@ async def _finish_login(phone: str, client: TelegramClient) -> None:
         if is_dead_error(exc):
             raise await _login_mark_dead(phone, client, exc) from exc
         raise
-    await client_manager.register_ready_client(phone, client)
-    await run_db(
-        account_repo.mark_logged_in,
-        phone,
-        getattr(me, "id", None),
-        getattr(me, "first_name", None),
-        getattr(me, "last_name", None),
-        getattr(me, "username", None),
-    )
+    await client_manager.register_ready_client(phone, client, me)
     _pending_login.pop(phone, None)
     logger.info("手机号登录成功 phone=%s tg_user_id=%s", phone, getattr(me, "id", None))
 
@@ -327,7 +328,7 @@ async def update_profile(phone: str, first_name, last_name, username, bio) -> No
     except Exception as exc:
         # 改资料时 get_me()/UpdateProfile RPC 抛终态死号异常 → 判死进死号列表 + 出池。
         if is_dead_error(exc):
-            await mark_dead_and_remove(phone, exc)
+            await mark_dead_and_remove(phone, exc, expected_client=client)
             raise AccountError(f"账号已失效({type(exc).__name__}),已移入死号列表") from exc
         raise AccountError(f"修改资料失败: {exc}") from exc
     await run_db(account_repo.update_profile, phone, first_name, last_name, username, bio)
@@ -358,8 +359,9 @@ async def update_avatar(phone: str, file_bytes: bytes, filename: str) -> None:
 
 async def offline(phone: str) -> None:
     phone = _normalize(phone)
-    await client_manager.remove(phone)
-    await run_db(account_repo.update_status, phone, int(AccountStatus.OFFLINE))
+    async with account_state_lock():
+        await run_db(account_repo.update_status, phone, int(AccountStatus.OFFLINE))
+        await client_manager.remove(phone)
     logger.info("小号主动下线 phone=%s", phone)
 
 
@@ -387,11 +389,10 @@ async def delete_account(phone: str) -> None:
     except Exception:
         pass
 
-    # 3. 单事务级联删 DB
-    await run_db(_cascade_delete, phone)
-
-    # 4. 断开 client
-    await client_manager.remove(phone)
+    # 3. 单事务级联删 DB，并与授权注册按同一账号状态锁线性化
+    async with account_state_lock():
+        await run_db(_cascade_delete, phone)
+        await client_manager.remove(phone)
 
     # 5. 删 session 文件
     try:

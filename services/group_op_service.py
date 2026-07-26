@@ -14,9 +14,11 @@ from typing import List
 from telethon import errors
 from telethon.tl import functions, types
 
+from config.constants import SendSource
 from config.settings import get_settings
 from core.batch_store import ITEM_FAILED, ITEM_SUCCESS, batch_store
 from core.client_manager import client_manager
+from core.message_sender import send_text
 from helpers import link_parser, td_error
 from helpers.dead_account import is_dead_error, mark_dead_and_remove
 from infra.db import run_db
@@ -49,7 +51,7 @@ async def run_join(phones: List[str], group_link: str, batch_id: str) -> None:
             logger.debug("[加群] %s 失败堆栈", phone, exc_info=True)
             # 终态死号异常 → 判死进死号列表 + 出池(统一口径)
             if is_dead_error(exc):
-                await mark_dead_and_remove(phone, exc)
+                await mark_dead_and_remove(phone, exc, expected_client=client)
     batch_store.finish(batch_id)
 
 
@@ -88,7 +90,7 @@ async def run_leave(phones: List[str], chat_id: int, batch_id: str) -> None:
         except Exception as exc:
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
             if is_dead_error(exc):
-                await mark_dead_and_remove(phone, exc)
+                await mark_dead_and_remove(phone, exc, expected_client=client)
     batch_store.finish(batch_id)
 
 
@@ -103,23 +105,18 @@ async def run_broadcast(phones: List[str], chat_id: int, content: str, batch_id:
     logger.info("[群发] 批次=%s 目标群=%s 号数=%d", batch_id, chat_id, len(phones))
     for phone in phones:
         await asyncio.sleep(random.uniform(risk.join_jitter_min_sec, risk.join_jitter_max_sec))
-        client = client_manager.get_ready_client(phone)
-        if client is None:
-            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason="小号未就绪")
-            continue
+        # 复用低优先级发送策略，统一节流、FloodWait、发送日志和死号处理。
         try:
-            entity = await client.get_entity(chat_id)
-            await client.send_message(entity, content)
+            ok, reason = await send_text(phone, chat_id, content, source=SendSource.SCHEDULE)
+        except Exception as exc:
+            ok, reason = False, td_error.translate(exc)
+            logger.exception("[群发] %s 发送流程异常 群=%s", phone, chat_id)
+        if ok:
             batch_store.set_item(batch_id, phone, ITEM_SUCCESS, chat_id=chat_id)
             logger.info("[群发] %s 已发送 chat=%s", phone, chat_id)
-        except Exception as exc:
-            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=td_error.translate(exc))
-            logger.warning("[群发] %s 失败 群=%s 异常类型=%s 异常=%s",
-                           phone, chat_id, type(exc).__name__, exc)
-            logger.debug("[群发] %s 失败堆栈", phone, exc_info=True)
-            # 终态失效(封号/作废)才判死;其余发送失败(被群封/被禁言等)不判死,仅记失败原因
-            if is_dead_error(exc):
-                await mark_dead_and_remove(phone, exc)
+        else:
+            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=reason)
+            logger.warning("[群发] %s 失败 群=%s 原因=%s", phone, chat_id, reason)
     batch_store.finish(batch_id)
 
 
@@ -136,7 +133,7 @@ async def leave_one(phone: str, chat_id: int) -> None:
         # 即使 TG 端退群失败(如群已不存在),也清理本地路由记录
         await run_db(account_watch_repo.remove, phone, chat_id)
         if is_dead_error(exc):
-            await mark_dead_and_remove(phone, exc)
+            await mark_dead_and_remove(phone, exc, expected_client=client)
         raise RuntimeError(td_error.translate(exc)) from exc
     await run_db(account_watch_repo.remove, phone, chat_id)
     logger.info("[退群] %s 退出 chat=%s", phone, chat_id)
@@ -160,7 +157,7 @@ async def check_member(phones: List[str], chat_id: int) -> dict:
         except Exception as exc:
             not_in.append({"phone": phone, "reason": td_error.translate(exc)})
             if is_dead_error(exc):
-                await mark_dead_and_remove(phone, exc)
+                await mark_dead_and_remove(phone, exc, expected_client=client)
     return {"in": in_list, "notIn": not_in}
 
 

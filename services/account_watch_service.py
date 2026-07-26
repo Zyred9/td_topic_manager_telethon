@@ -6,8 +6,8 @@
 - 资料同步(问题5):用户在 TG 改了 username/昵称后台不更新,难以定位到号。巡检顺便
   拉取 get_me() 比对回写。
 
-巡检对象是 ClientManager 池内的号(即已登录、正在运行的号)。掉线/被封正发生在这些
-号上;池外的号本就是离线/需重登态,无需巡检。生命周期(start/stop)对齐 topic_scheduler。
+巡检对象包含 ClientManager 池内的号，以及 DB 中已登录/需重登但意外掉出池的号。
+用户主动下线的号不自动重连。生命周期(start/stop)对齐 topic_scheduler。
 """
 
 from __future__ import annotations
@@ -15,12 +15,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Dict, Optional
+from typing import Optional
 
 from config.constants import AccountStatus
 from config.settings import get_settings
 from core.client_manager import client_manager
-from helpers.dead_account import is_dead_error, mark_dead_and_remove, mark_dead_by_reason
+from helpers.dead_account import (
+    account_state_lock,
+    is_dead_error,
+    mark_dead_and_remove,
+    mark_dead_by_reason,
+    pending_dead_phones,
+    retry_pending_dead_marks,
+)
 from infra.db import run_db
 from repositories import account_repo, send_log_repo
 
@@ -30,64 +37,103 @@ logger = logging.getLogger(__name__)
 _JITTER_MIN_SEC = 1.0
 _JITTER_MAX_SEC = 2.0
 
-# 误杀防护:模糊失败(超时/连不上/非终态 RPC)连续这么多轮巡检都失败才判死。
-# 明确的终态死号异常(session 作废/账号封禁)不走累计,立即判死。
-_DEAD_CONFIRM_ROUNDS = 2
-
-# phone -> 连续模糊探活失败轮数。探活成功 / 判死 / 复活后清零。进程内即可,
-# 重启后从 0 重新累计,不需要落库。
-_probe_fail_streak: Dict[str, int] = {}
-
 _watch_task: Optional[asyncio.Task] = None
 
 
-def _clear_streak(phone: str) -> None:
-    _probe_fail_streak.pop(phone, None)
-
-
-async def _mark_dead(phone: str, exc: BaseException) -> None:
-    """命中终态死号异常:走公共口径标死+出池,并清本服务的失败计数。"""
+async def _mark_dead(phone: str, exc: BaseException, expected_client, expected_statuses) -> None:
+    """命中终态死号异常:走公共口径标死并出池。"""
     logger.warning("巡检判定死号 phone=%s reason=%s", phone, type(exc).__name__, exc_info=exc)
-    await mark_dead_and_remove(phone, exc)
-    _clear_streak(phone)
+    await mark_dead_and_remove(
+        phone,
+        exc,
+        expected_client=expected_client,
+        expected_statuses=expected_statuses,
+    )
 
 
-async def _on_ambiguous_fail(phone: str, exc: BaseException) -> None:
-    """模糊探活失败(超时/连不上/非终态 RPC):累计;连续够轮数才判死,中间先置离线。
+async def _on_ambiguous_fail(
+    phone: str,
+    exc: BaseException,
+    expected_client,
+    expected_statuses,
+) -> None:
+    """模糊探活失败只置需重登并出池，后续使用新 client 重连。"""
+    async with account_state_lock():
+        current_client = client_manager.get_client(phone)
+        if current_client is not expected_client:
+            logger.info("巡检旧 client 失败结果已过期,跳过状态变更 phone=%s", phone)
+            return
+        logger.warning("巡检探活失败,置需重登并出池 phone=%s", phone, exc_info=exc)
+        should_remove = True
+        try:
+            if expected_statuses is None:
+                await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+            else:
+                affected = await run_db(
+                    account_repo.update_status_if_current,
+                    phone,
+                    int(AccountStatus.NEED_RELOGIN),
+                    expected_statuses,
+                )
+                if not affected:
+                    should_remove = False
+                    return
+        finally:
+            if should_remove:
+                await client_manager.remove(phone)
 
-    防止偶发网络抖动把好号误杀进死号列表。明确终态异常不走这里(直接判死)。
-    """
-    streak = _probe_fail_streak.get(phone, 0) + 1
-    _probe_fail_streak[phone] = streak
-    if streak >= _DEAD_CONFIRM_ROUNDS:
-        logger.warning("巡检探活连续 %d 轮失败,判定死号 phone=%s reason=%s",
-                       streak, phone, type(exc).__name__, exc_info=exc)
-        await mark_dead_and_remove(phone, exc)
-        _clear_streak(phone)
-    else:
-        logger.warning("巡检探活失败(第 %d/%d 轮),先置离线观察 phone=%s",
-                       streak, _DEAD_CONFIRM_ROUNDS, phone, exc_info=exc)
-        await run_db(account_repo.update_status, phone, int(AccountStatus.OFFLINE))
 
-
-async def _check_one(phone: str) -> None:
-    """巡检单个号:真发一次网络请求探活,据结果判死/置离线/同步资料。"""
+async def _check_one(phone: str, account=None) -> None:
+    """巡检单个号:真发一次网络请求探活,据结果判死/置需重登/同步资料。"""
     client = client_manager.get_ready_client(phone)
     if client is None:
         # 池里有该号但连接已断:尝试重连一次
         raw = client_manager.get_client(phone)
         if raw is None:
+            if account is None:
+                return
+            try:
+                await asyncio.wait_for(
+                    client_manager.connect_account(account),
+                    timeout=client_manager.CONNECT_TIMEOUT,
+                )
+            except Exception as exc:
+                if is_dead_error(exc):
+                    await _mark_dead(
+                        phone,
+                        exc,
+                        expected_client=None,
+                        expected_statuses=(int(account.status),),
+                    )
+                else:
+                    await _on_ambiguous_fail(
+                        phone,
+                        exc,
+                        expected_client=None,
+                        expected_statuses=(int(account.status),),
+                    )
             return
         try:
             await raw.connect()
         except Exception as exc:
-            # 连不上属模糊失败,走累计判死(可能只是临时网络问题)
-            await _on_ambiguous_fail(phone, exc)
+            if is_dead_error(exc):
+                await _mark_dead(phone, exc, expected_client=raw, expected_statuses=None)
+            else:
+                await _on_ambiguous_fail(
+                    phone,
+                    exc,
+                    expected_client=raw,
+                    expected_statuses=None,
+                )
             return
         client = raw if raw.is_connected() else None
         if client is None:
-            logger.warning("巡检重连后仍未连接,置离线 phone=%s", phone)
-            await run_db(account_repo.update_status, phone, int(AccountStatus.OFFLINE))
+            await _on_ambiguous_fail(
+                phone,
+                RuntimeError("重连后仍未连接"),
+                expected_client=raw,
+                expected_statuses=None,
+            )
             return
 
     # 探活:必须真发一次需鉴权的请求。不能用 is_user_authorized() —— 它读 client
@@ -98,17 +144,26 @@ async def _check_one(phone: str) -> None:
         me = await client.get_me()
     except Exception as exc:
         if is_dead_error(exc):
-            await _mark_dead(phone, exc)
+            await _mark_dead(phone, exc, expected_client=client, expected_statuses=None)
         else:
-            await _on_ambiguous_fail(phone, exc)
+            await _on_ambiguous_fail(
+                phone,
+                exc,
+                expected_client=client,
+                expected_statuses=None,
+            )
         return
     if me is None:
         # 拿不到自身实体:视作未授权,按模糊失败累计(不直接判死,留重登余地)
-        await _on_ambiguous_fail(phone, RuntimeError("get_me() 返回 None,疑似未授权"))
+        await _on_ambiguous_fail(
+            phone,
+            RuntimeError("get_me() 返回 None,疑似未授权"),
+            expected_client=client,
+            expected_statuses=None,
+        )
         return
 
-    # 探活成功:清零失败计数,同步实时资料(问题5)
-    _clear_streak(phone)
+    # 探活成功:同步实时资料(问题5)
     await _sync_profile(phone, me)
 
 
@@ -158,14 +213,31 @@ async def scan_dead_on_startup() -> None:
 
 
 async def _watch_tick() -> None:
-    """一轮巡检:逐个检查池内号,号间抖动,单号异常隔离不中断整轮。"""
-    phones = client_manager.all_phones()
+    """一轮巡检:检查池内号，并补连意外掉出池的已登录/需重登账号。"""
+    await retry_pending_dead_marks()
+    pending_phones = pending_dead_phones()
+    accounts_by_phone = {}
+    try:
+        accounts = await run_db(
+            account_repo.find_by_statuses,
+            [int(AccountStatus.LOGGED_IN), int(AccountStatus.NEED_RELOGIN)],
+        )
+        accounts_by_phone = {
+            account.phone: account for account in accounts
+            if account.phone not in pending_phones
+        }
+    except Exception:
+        logger.exception("巡检查询池外候选失败,本轮仅检查池内号")
+    phones = [
+        phone for phone in dict.fromkeys([*client_manager.all_phones(), *accounts_by_phone])
+        if phone not in pending_phones
+    ]
     if not phones:
         return
     logger.info("小号巡检开始,本轮 %d 个号", len(phones))
     for phone in phones:
         try:
-            await _check_one(phone)
+            await _check_one(phone, accounts_by_phone.get(phone))
         except asyncio.CancelledError:
             raise
         except Exception as exc:

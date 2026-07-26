@@ -61,17 +61,18 @@ async def lifespan(app: FastAPI):
     from services import dm_service
     dm_service.register()
 
-    # 小号全起放后台:全起是串行连接、每号最多 15s,几十上百个号会阻塞 lifespan 几分钟,
-    # 期间 uvicorn 还没开始收请求 → web 全部 502/超时。改成后台任务异步连,服务立即可用,
-    # 小号慢慢进池;还没连上的号被请求用到时,get_ready_client 返回 None 走「小号未就绪」提示。
+    # 先完成轻量 DB 预处理，再进入 web/后台任务并发阶段，避免启动批量状态写覆盖新请求。
     from core.client_manager import client_manager
     from services import account_watch_service
 
+    await client_manager.prepare_startup()
+    # 历史日志补判死也在并发边界前完成，确保判死后的号不会进入后台全起候选。
+    await account_watch_service.scan_dead_on_startup()
+
+    # 逐号全起放后台:串行连接每号最多 15s,几十上百个号可能耗时数分钟；web 不等待。
+
     async def _background_startup() -> None:
         try:
-            # 先按发送日志统计补判死(累计失败 ≥ 阈值):这些号判死后 find_by_statuses
-            # 过滤 is_dead=0,不会被全起进池。补「死号列表为空」的根因。
-            await account_watch_service.scan_dead_on_startup()
             logger.info("后台全起已登录小号(不阻塞 web)...")
             await client_manager.startup()
             # 全起完再启动话题自驱(否则池里还没号,自驱空跑)

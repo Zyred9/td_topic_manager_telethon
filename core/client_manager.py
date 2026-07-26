@@ -17,7 +17,14 @@ from telethon import TelegramClient, errors, events
 
 from config.constants import AccountStatus
 from core import update_router
-from helpers.dead_account import is_dead_error
+from helpers.dead_account import (
+    account_state_lock,
+    clear_pending_dead,
+    is_dead_error,
+    mark_dead_and_remove,
+    mark_dead_by_reason,
+    pending_dead_phones,
+)
 from infra import telethon_factory
 from infra.db import run_db
 from repositories import account_repo
@@ -49,10 +56,14 @@ class ClientManager:
 
     # ---------- 全起 ----------
     # 单个号启动连接超时(秒),防某个号卡死拖垮整个启动
-    _CONNECT_TIMEOUT = 15.0
+    CONNECT_TIMEOUT = 15.0
+
+    async def prepare_startup(self) -> None:
+        """进入并发启动前重置上次运行遗留的登录中状态。"""
+        await run_db(account_repo.reset_all_status_on_startup)
 
     async def startup(self) -> None:
-        """服务启动:重置遗留状态,再把"已登录(3)"和"需重新登录(5)"的号都试连。
+        """后台连接"已登录(3)"和"需重新登录(5)"的小号。
 
         协议号 session 是已登录态凭证,connect 即生效不需验证码,所以状态 5 的号
         若只是上次临时连接失败被误标,本次能连上就自动恢复成状态 3。
@@ -61,7 +72,6 @@ class ClientManager:
           - 超时 / 其它未知异常:可能临时故障 → 维持 NEED_RELOGIN(5)留主列表,下次再试;
           - 连上且已授权:恢复为已登录(3)。
         """
-        await run_db(account_repo.reset_all_status_on_startup)
         accounts = await run_db(
             account_repo.find_by_statuses,
             [int(AccountStatus.LOGGED_IN), int(AccountStatus.NEED_RELOGIN)],
@@ -69,10 +79,10 @@ class ClientManager:
         logger.info("启动全起:发现 %d 个小号待试连(含需重新登录的)", len(accounts))
         for acc in accounts:
             try:
-                await asyncio.wait_for(self._connect_account(acc), timeout=self._CONNECT_TIMEOUT)
+                await asyncio.wait_for(self.connect_account(acc), timeout=self.CONNECT_TIMEOUT)
             except asyncio.TimeoutError:
-                logger.warning("全起小号超时(%.0fs),跳过 phone=%s", self._CONNECT_TIMEOUT, acc.phone)
-                await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
+                logger.warning("全起小号超时(%.0fs),跳过 phone=%s", self.CONNECT_TIMEOUT, acc.phone)
+                await self._mark_reconnect_needed_if_current(acc)
             except errors.AuthKeyDuplicatedError as exc:
                 # session 在多个 IP 同时使用被 TG 作废,是明确终态失效、无法恢复,
                 # 该号对运营已无用 → 判死进死号列表(不是临时故障,不刷堆栈)。
@@ -80,20 +90,43 @@ class ClientManager:
                     "小号 %s 的 session 已被 Telegram 作废(同一 session 在多个 IP 使用),判定死号",
                     acc.phone,
                 )
-                await run_db(account_repo.mark_dead, acc.phone,
-                             type(exc).__name__, "启动连接时 session 被作废(多 IP 撞车)")
+                await mark_dead_and_remove(
+                    acc.phone,
+                    exc,
+                    expected_client=None,
+                    expected_statuses=(int(acc.status),),
+                )
             except Exception as exc:
                 # connect()/get_me() 直接抛出的终态死号异常(UnauthorizedError 系等)会落到
                 # 这里:该号已不可恢复,判死进死号列表,不再降级为 NEED_RELOGIN 赖在主列表。
                 # (此时号尚未进池,直接 mark_dead 即可,无需出池。)
                 if is_dead_error(exc):
                     logger.warning("全起小号死号异常 phone=%s reason=%s", acc.phone, type(exc).__name__)
-                    await run_db(account_repo.mark_dead, acc.phone, type(exc).__name__, str(exc))
+                    await mark_dead_and_remove(
+                        acc.phone,
+                        exc,
+                        expected_client=None,
+                        expected_statuses=(int(acc.status),),
+                    )
                 else:
                     logger.exception("全起小号失败 phone=%s", acc.phone)
-                    await run_db(account_repo.update_status, acc.phone, int(AccountStatus.NEED_RELOGIN))
+                    await self._mark_reconnect_needed_if_current(acc)
 
-    async def _connect_account(self, account) -> None:
+    async def _mark_reconnect_needed_if_current(self, account) -> bool:
+        """池仍为空且账号状态未离开启动快照时，才提交重连失败。"""
+        async with account_state_lock():
+            if self.get_client(account.phone) is not None:
+                return False
+            affected = await run_db(
+                account_repo.update_status_if_current,
+                account.phone,
+                int(AccountStatus.NEED_RELOGIN),
+                (int(account.status),),
+            )
+            return bool(affected)
+
+    async def connect_account(self, account) -> None:
+        """使用账号现有 session 连接并注册到 client 池。"""
         client = telethon_factory.build_client_for_account(account)
         registered = False
         try:
@@ -103,22 +136,47 @@ class ClientManager:
                 # (协议号无法靠验证码重登,手机号也需重新走登录流程)。直接判死进死号
                 # 列表,由运营复活或彻底删除,不再赖在主列表里反复点「重新登录」也救不活。
                 logger.warning("小号 %s 会话已失效,判定死号", account.phone)
-                await run_db(account_repo.mark_dead, account.phone,
-                             "SessionInvalid", "启动连接时 session 已失效(未授权)")
+                await mark_dead_by_reason(
+                    account.phone, "SessionInvalid", "连接时 session 已失效(未授权)",
+                    expected_client=None,
+                    expected_statuses=(int(account.status),),
+                )
                 return
             me = await client.get_me()
-            self._register_events(account.phone, client)
-            self._clients[account.phone] = client
-            registered = True  # 已进池,交给池管理,后续不在此 disconnect
-            await run_db(
-                account_repo.mark_logged_in,
-                account.phone,
-                getattr(me, "id", None),
-                getattr(me, "first_name", None),
-                getattr(me, "last_name", None),
-                getattr(me, "username", None),
-            )
+            async with account_state_lock():
+                if account.phone in pending_dead_phones():
+                    logger.info("小号 %s 存在待落库死号标记,跳过旧 session 注册", account.phone)
+                    return
+                async with self._lock:
+                    existing = self._clients.get(account.phone)
+                    if existing is not None and existing.is_connected():
+                        logger.info("小号 %s 已由并发登录接管,跳过旧 session 注册", account.phone)
+                        return
+                    affected = await run_db(
+                        account_repo.mark_logged_in,
+                        account.phone,
+                        getattr(me, "id", None),
+                        getattr(me, "first_name", None),
+                        getattr(me, "last_name", None),
+                        getattr(me, "username", None),
+                        True,
+                    )
+                    if not affected:
+                        logger.info("小号 %s 重连提交已失效,不注册 client", account.phone)
+                        return
+                    await self._register_ready_client_locked(account.phone, client)
+                    registered = True  # 已进池,交给池管理,后续不在此 disconnect
             logger.info("小号 %s 重连成功 tg_user_id=%s", account.phone, getattr(me, "id", None))
+        except Exception as exc:
+            if is_dead_error(exc):
+                await mark_dead_and_remove(
+                    account.phone,
+                    exc,
+                    expected_client=None,
+                    expected_statuses=(int(account.status),),
+                )
+                return
+            raise
         finally:
             # 未进池的 client(失效/异常)一律断开,防半开连接泄漏
             if not registered:
@@ -133,17 +191,34 @@ class ClientManager:
         async def _on_new_message(event):  # noqa: ANN001
             await update_router.dispatch(phone, event)
 
-    async def register_ready_client(self, phone: str, client: TelegramClient) -> None:
+    async def register_ready_client(self, phone: str, client: TelegramClient, me) -> None:
         """登录服务(协议号/手机号)完成授权后,把 client 交给池统一持有。"""
-        async with self._lock:
-            old = self._clients.get(phone)
-            if old is not None and old is not client:
-                try:
-                    await old.disconnect()
-                except Exception:
-                    pass
-            self._register_events(phone, client)
-            self._clients[phone] = client
+        async with account_state_lock():
+            affected = await run_db(
+                account_repo.mark_logged_in,
+                phone,
+                getattr(me, "id", None),
+                getattr(me, "first_name", None),
+                getattr(me, "last_name", None),
+                getattr(me, "username", None),
+                False,
+            )
+            if not affected:
+                raise RuntimeError(f"账号 {phone} 授权状态提交失败,未注册 client")
+            async with self._lock:
+                await self._register_ready_client_locked(phone, client)
+                clear_pending_dead(phone)
+
+    async def _register_ready_client_locked(self, phone: str, client: TelegramClient) -> None:
+        """调用方持有 _lock 时替换 client。"""
+        old = self._clients.get(phone)
+        if old is not None and old is not client:
+            try:
+                await old.disconnect()
+            except Exception:
+                pass
+        self._register_events(phone, client)
+        self._clients[phone] = client
 
     async def remove(self, phone: str) -> None:
         """移出池并断开(删除小号/失效时)。"""

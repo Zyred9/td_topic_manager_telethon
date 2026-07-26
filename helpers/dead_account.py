@@ -19,11 +19,18 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+from typing import Any, Collection
 
 from telethon import errors
 
 logger = logging.getLogger(__name__)
+
+# ponytail: 判死与授权注册都是低频状态转换，一个全局锁足够，也更容易保证顺序一致。
+_account_state_lock = asyncio.Lock()
+_pending_dead: dict[str, tuple[object, str, str, tuple[int, ...] | None]] = {}
+_EXPECTED_CLIENT_UNSET = object()
 
 # 不在 UnauthorizedError 基类下、但仍属终态失效,需显式补充的异常类型
 _EXTRA_DEAD_ERRORS: tuple[type[BaseException], ...] = (
@@ -59,7 +66,17 @@ def is_send_dead_error(exc: BaseException) -> bool:
     return isinstance(exc, errors.UserBannedInChannelError)
 
 
-async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
+def account_state_lock() -> asyncio.Lock:
+    """返回判死/授权注册共享的账号状态转换锁。"""
+    return _account_state_lock
+
+
+async def mark_dead_and_remove(
+    phone: str,
+    exc: BaseException,
+    expected_client: Any = _EXPECTED_CLIENT_UNSET,
+    expected_statuses: Collection[int] | None = None,
+) -> bool:
     """死号统一落库口径(全项目唯一实现):标 is_dead=1 + 移出 client 池。
 
     所有链路(发送 / 巡检 / 启动 / 登录 / 导入 / 群操作 / 移交群主 / 私聊下载)捕获到
@@ -71,35 +88,107 @@ async def mark_dead_and_remove(phone: str, exc: BaseException) -> bool:
     延迟 import account_repo / client_manager:本模块被 message_sender 等底层模块依赖,
     模块级 import 会形成循环,放函数内规避。
     """
-    return await _mark_and_remove(phone, type(exc).__name__, str(exc))
+    return await _mark_and_remove(
+        phone,
+        type(exc).__name__,
+        str(exc),
+        expected_client=expected_client,
+        expected_statuses=expected_statuses,
+    )
 
 
-async def mark_dead_by_reason(phone: str, err_code: str, err_desc: str) -> bool:
+async def mark_dead_by_reason(
+    phone: str,
+    err_code: str,
+    err_desc: str,
+    expected_client: Any = _EXPECTED_CLIENT_UNSET,
+    expected_statuses: Collection[int] | None = None,
+) -> bool:
     """无异常对象时的判死入口(如启动扫描按发送日志统计判死)。
 
     与 mark_dead_and_remove 共用唯一落库+出池实现,只是 reason 由调用方按业务语义给,
     不是从异常派生。幂等(WHERE is_dead=0)。
     """
-    return await _mark_and_remove(phone, err_code, err_desc)
+    return await _mark_and_remove(
+        phone,
+        err_code,
+        err_desc,
+        expected_client=expected_client,
+        expected_statuses=expected_statuses,
+    )
 
 
-async def _mark_and_remove(phone: str, err_code: str, err_desc: str) -> bool:
+async def _mark_and_remove(
+    phone: str,
+    err_code: str,
+    err_desc: str,
+    expected_client: Any = _EXPECTED_CLIENT_UNSET,
+    expected_statuses: Collection[int] | None = None,
+    pending_token: object | None = None,
+) -> bool:
     """死号落库的唯一实现:标 is_dead=1(幂等,WHERE is_dead=0)+ 移出 client 池。
     失败仅记日志、不抛,绝不阻塞调用方主流程。"""
     from core.client_manager import client_manager
     from infra.db import run_db
     from repositories import account_repo
 
-    marked = False
-    try:
-        affected = await run_db(account_repo.mark_dead, phone, err_code, err_desc)
-        marked = bool(affected)
-        if marked:
+    async with _account_state_lock:
+        pending = _pending_dead.get(phone)
+        if pending_token is not None and (pending is None or pending[0] is not pending_token):
+            return False
+
+        current_client = client_manager.get_client(phone)
+        if expected_client is not _EXPECTED_CLIENT_UNSET and current_client is not expected_client:
+            return False
+
+        normalized_statuses = (
+            None
+            if expected_statuses is None
+            else tuple(sorted({int(status) for status in expected_statuses}))
+        )
+        marked = False
+        try:
+            affected = await run_db(
+                account_repo.mark_dead,
+                phone,
+                err_code,
+                err_desc,
+                normalized_statuses,
+            )
+            marked = bool(affected)
+            _pending_dead.pop(phone, None)
+            if not marked:
+                return False
             logger.warning("[死号] phone=%s 已标记失效 reason=%s", phone, err_code)
-    except Exception as e2:
-        logger.warning("[死号] 标记失败 phone=%s: %s", phone, e2)
-    try:
-        await client_manager.remove(phone)
-    except Exception as e2:
-        logger.warning("[死号] 移出 client 池失败 phone=%s: %s", phone, e2)
-    return marked
+        except Exception as e2:
+            logger.warning("[死号] 标记失败 phone=%s: %s", phone, e2)
+            token = pending_token if pending_token is not None else object()
+            _pending_dead[phone] = (token, err_code, err_desc, normalized_statuses)
+        try:
+            await client_manager.remove(phone)
+        except Exception as e2:
+            logger.warning("[死号] 移出 client 池失败 phone=%s: %s", phone, e2)
+        return marked
+
+
+def pending_dead_phones() -> set[str]:
+    """返回尚未成功落库的死号手机号快照。"""
+    return set(_pending_dead)
+
+
+def clear_pending_dead(phone: str) -> None:
+    """新授权 client 成功接管后清除旧 session 遗留的待标死记录。"""
+    _pending_dead.pop(phone, None)
+
+
+async def retry_pending_dead_marks() -> None:
+    """重试此前因数据库异常未落库的死号标记。"""
+    for phone, pending in list(_pending_dead.items()):
+        token, err_code, err_desc, expected_statuses = pending
+        await _mark_and_remove(
+            phone,
+            err_code,
+            err_desc,
+            expected_statuses=expected_statuses,
+            pending_token=token,
+        )

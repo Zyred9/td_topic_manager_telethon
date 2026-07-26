@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import List, Optional, Tuple
+from typing import Collection, List, Optional, Tuple
 
 from entities.account import Account
 from infra.db import get_connection
@@ -134,7 +134,12 @@ def page_dead(
     return [Account.from_row(r) for r in rows], total
 
 
-def mark_dead(phone: str, err_code: str, err_desc: str) -> int:
+def mark_dead(
+    phone: str,
+    err_code: str,
+    err_desc: str,
+    expected_statuses: Optional[Collection[int]] = None,
+) -> int:
     """打死号标。err_code+desc 拼成 dead_reason 存。
 
     WHERE is_dead=0 保证只标第一次,后续重复触发的更新返回 0 行(口径口径稳定,
@@ -148,9 +153,17 @@ def mark_dead(phone: str, err_code: str, err_desc: str) -> int:
         "UPDATE t_account SET is_dead=1, dead_reason=%s, dead_time=%s, "
         "status=5 WHERE phone=%s AND is_dead=0"
     )
+    params = [reason, now, phone]
+    if expected_statuses is not None:
+        statuses = sorted({int(status) for status in expected_statuses})
+        if not statuses:
+            return 0
+        placeholders = ",".join(["%s"] * len(statuses))
+        sql += f" AND status IN ({placeholders})"
+        params.extend(statuses)
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (reason, now, phone))
+            cur.execute(sql, tuple(params))
             return int(cur.rowcount)
 
 
@@ -226,8 +239,29 @@ def update_status(phone: str, status: int) -> None:
             )
 
 
+def update_status_if_current(
+    phone: str,
+    status: int,
+    expected_statuses: Collection[int],
+) -> int:
+    """账号仍存活且处于预期状态时更新状态，返回受影响行数。"""
+    statuses = sorted({int(expected) for expected in expected_statuses})
+    if not statuses:
+        return 0
+    placeholders = ",".join(["%s"] * len(statuses))
+    sql = (
+        f"UPDATE t_account SET status=%s WHERE phone=%s AND is_dead=0 "
+        f"AND status IN ({placeholders})"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (status, phone, *statuses))
+            return int(cur.rowcount)
+
+
 def mark_logged_in(phone: str, tg_user_id: Optional[int], first_name: Optional[str],
-                   last_name: Optional[str], username: Optional[str]) -> None:
+                   last_name: Optional[str], username: Optional[str],
+                   reconnect_only: bool = False) -> int:
     """登录成功:回填 TG 信息 + status=3 + login_time。
 
     不写 update_time:登录回填(含巡检同步 TG 昵称)不是 web 主动编辑资料,
@@ -236,11 +270,16 @@ def mark_logged_in(phone: str, tg_user_id: Optional[int], first_name: Optional[s
     now = datetime.now()
     sql = (
         "UPDATE t_account SET status=3, tg_user_id=%s, tg_first_name=%s, tg_last_name=%s, "
-        "tg_username=%s, login_time=%s WHERE phone=%s"
+        "tg_username=%s, login_time=%s"
     )
+    if reconnect_only:
+        sql += " WHERE phone=%s AND is_dead=0 AND status IN (3,5)"
+    else:
+        sql += ", is_dead=0, dead_reason=NULL, dead_time=NULL WHERE phone=%s"
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, (tg_user_id, first_name, last_name, username, now, phone))
+            return int(cur.rowcount)
 
 
 def update_profile(phone: str, first_name: Optional[str], last_name: Optional[str],
@@ -292,12 +331,12 @@ def update_persona(phone: str, persona_json: Optional[str]) -> None:
 
 
 def reset_all_status_on_startup() -> None:
-    """服务启动:上次运行态(初始化中1/等待码2)统一置离线(4),
+    """服务启动:上次运行态(初始化中1/等待码2/等待2FA 6)统一置离线(4),
     已登录(3)的号保持 3 交给 ClientManager 全起后重连校验回写,
-    不动 NEED_RELOGIN(5)/WAIT_2FA(6)。"""
+    不动 NEED_RELOGIN(5)。"""
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE t_account SET status=4 WHERE status IN (1,2)")
+            cur.execute("UPDATE t_account SET status=4 WHERE status IN (1,2,6)")
 
 
 def delete_by_phone(phone: str) -> int:

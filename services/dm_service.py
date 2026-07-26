@@ -130,7 +130,7 @@ async def _maybe_download(phone: str, sender_id: int, message, msg_type: str):
         logger.warning("[私聊] 媒体下载失败 phone=%s: %s", phone, exc)
         # 下载 RPC 抛终态死号异常 → 判死进死号列表 + 出池(对齐全项目口径)
         if is_dead_error(exc):
-            await mark_dead_and_remove(phone, exc)
+            await mark_dead_and_remove(phone, exc, expected_client=client)
         return None, size, "下载异常"
 
 

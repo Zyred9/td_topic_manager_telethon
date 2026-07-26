@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from config.settings import get_settings
@@ -20,6 +21,15 @@ class Throttle:
         # phone -> (window_start_epoch_sec, count)
         self._minute: dict[str, tuple[float, int]] = {}
         self._reply_lock: dict[str, float] = {}
+        self._send_locks: dict[str, asyncio.Lock] = {}
+
+    def send_lock(self, phone: str) -> asyncio.Lock:
+        """同一小号的完整发送流程串行执行。"""
+        lock = self._send_locks.get(phone)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._send_locks[phone] = lock
+        return lock
 
     # ---------- 最小间隔 ----------
     def can_send_now(self, phone: str) -> bool:

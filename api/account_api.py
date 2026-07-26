@@ -10,6 +10,7 @@ from api.deps import BizError, CurrentUser, get_current_user, result
 from api.schemas import CodeReq, PhoneLoginReq, ProfileReq
 from core.batch_store import batch_store
 from core.lifecycle import task_tracker
+from infra.db import run_db
 from services import account_service, import_service
 from services.account_service import AccountError
 
@@ -112,20 +113,26 @@ async def upload_avatar(
 
 @router.post("/import/zip")
 async def import_zip(zip: UploadFile = File(...), _: CurrentUser = Depends(get_current_user)) -> dict:
-    content = await zip.read()
-    zip_path = import_service.save_upload(content)
+    try:
+        zip_path = await run_db(import_service.save_upload, zip.file)
+    except ValueError as exc:
+        raise BizError(str(exc)) from exc
     extract_root = zip_path.with_suffix("")  # 同名无后缀目录作解压根
     try:
         total = await _count(zip_path, extract_root)
     except Exception as exc:
+        import_service.cleanup_import_files(zip_path, extract_root)
         raise BizError(f"解压失败: {exc}") from exc
-    batch_id = batch_store.create("import", total, ttl_sec=24 * 3600)
-    task_tracker.create_task(import_service.run_import(zip_path, batch_id, extract_root))
+    try:
+        batch_id = batch_store.create("import", total, ttl_sec=24 * 3600)
+        task_tracker.create_task(import_service.run_import(zip_path, batch_id, extract_root))
+    except Exception:
+        import_service.cleanup_import_files(zip_path, extract_root)
+        raise
     return result(batch_id)
 
 
 async def _count(zip_path, extract_root) -> int:
-    from infra.db import run_db
     return await run_db(import_service.count_phone_dirs, zip_path, extract_root)
 
 

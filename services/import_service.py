@@ -25,9 +25,10 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import uuid
 import zipfile
-from pathlib import Path
-from typing import Optional
+from pathlib import Path, PurePosixPath
+from typing import BinaryIO, Optional
 
 from telethon import errors
 
@@ -36,23 +37,46 @@ from config.settings import get_settings
 from core import update_router  # noqa: F401
 from core.batch_store import ITEM_FAILED, ITEM_SUCCESS, batch_store
 from core.client_manager import client_manager
-from helpers.dead_account import is_dead_error
+from helpers.dead_account import (
+    account_state_lock,
+    is_dead_error,
+    mark_dead_and_remove,
+    mark_dead_by_reason,
+)
 from infra import telethon_factory
 from infra.db import run_db
 from repositories import account_repo
 
 logger = logging.getLogger(__name__)
 
+MAX_UPLOAD_BYTES = 200 * 1024 * 1024
+MAX_EXTRACTED_BYTES = 200 * 1024 * 1024
+MAX_ZIP_MEMBERS = 10_000
+UPLOAD_CHUNK_BYTES = 1024 * 1024
+_IMPORT_PENDING_STATUSES = (int(AccountStatus.INITIALIZING),)
+
 # 目录名 = 手机号(允许 phone_ / phone= 前缀,8~15 位数字)
 _DIR_RE = re.compile(r"^(?:phone[_=])?(\+?\d{8,15})$")
 
 
-def save_upload(file_bytes: bytes) -> Path:
+def save_upload(source: BinaryIO) -> Path:
+    """分块保存上传文件，并在超过部署上传上限时删除残片。"""
     settings = get_settings()
-    import uuid
     path = settings.upload_dir / f"{uuid.uuid4().hex}.zip"
-    path.write_bytes(file_bytes)
-    return path
+    total = 0
+    try:
+        with path.open("xb") as target:
+            while chunk := source.read(UPLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > MAX_UPLOAD_BYTES:
+                    raise ValueError("ZIP 文件不能超过 200MB")
+                target.write(chunk)
+        if total == 0:
+            raise ValueError("ZIP 文件不能为空")
+        return path
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
 
 
 _PHONE_FROM_NAME_RE = re.compile(r"^\+?(\d{8,15})$")
@@ -115,31 +139,80 @@ def scan_phone_dirs(extract_root: Path) -> list[tuple[str, Path]]:
 def count_phone_dirs(zip_path: Path, extract_root: Path) -> int:
     """先解压并统计号目录数(用于 batch total)。两种布局都支持。"""
     with zipfile.ZipFile(zip_path) as zf:
+        _validate_zip(zf, extract_root)
         zf.extractall(extract_root)
     _normalize_flat_layout(extract_root)
     return len(scan_phone_dirs(extract_root))
 
 
+def _validate_zip(zf: zipfile.ZipFile, extract_root: Path) -> None:
+    """解压前校验成员路径、数量和声明的解压总量。"""
+    members = zf.infolist()
+    if len(members) > MAX_ZIP_MEMBERS:
+        raise ValueError(f"ZIP 文件数量不能超过 {MAX_ZIP_MEMBERS}")
+
+    root = extract_root.resolve()
+    total = 0
+    for member in members:
+        total += member.file_size
+        if total > MAX_EXTRACTED_BYTES:
+            raise ValueError("ZIP 解压后总大小不能超过 200MB")
+
+        member_path = PurePosixPath(member.filename.replace("\\", "/"))
+        if (
+            not member_path.parts
+            or member_path.is_absolute()
+            or ".." in member_path.parts
+            or any(":" in part for part in member_path.parts)
+        ):
+            raise ValueError(f"ZIP 包含非法路径: {member.filename}")
+        try:
+            (root / Path(*member_path.parts)).resolve().relative_to(root)
+        except ValueError as exc:
+            raise ValueError(f"ZIP 包含非法路径: {member.filename}") from exc
+
+
+def cleanup_import_files(zip_path: Path, extract_root: Path) -> None:
+    """删除含 session/2FA 的原始压缩包和临时解压目录。"""
+    shutil.rmtree(extract_root, ignore_errors=True)
+    zip_path.unlink(missing_ok=True)
+
+
 async def run_import(zip_path: Path, batch_id: str, extract_root: Path) -> None:
     """异步执行导入(已解压)。逐号处理并写 batch_store。"""
-    settings = get_settings()
-    dirs = scan_phone_dirs(extract_root)
-    if not dirs:
-        logger.warning("[导入] batch=%s 未扫描到任何号目录", batch_id)
+    try:
+        settings = get_settings()
+        dirs = scan_phone_dirs(extract_root)
+        if not dirs:
+            logger.warning("[导入] batch=%s 未扫描到任何号目录", batch_id)
+            batch_store.finish(batch_id)
+            return
+
+        for phone, dir_path in dirs:
+            try:
+                await _import_one(phone, dir_path, settings.sessions_dir, batch_id)
+            except Exception as exc:
+                logger.exception("[导入] %s 失败", phone)
+                batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=str(exc))
+
         batch_store.finish(batch_id)
-        return
+        logger.info("[导入] batch=%s 完成,共 %d 个号", batch_id, len(dirs))
+    finally:
+        cleanup_import_files(zip_path, extract_root)
 
-    for phone, dir_path in dirs:
-        try:
-            await _import_one(phone, dir_path, settings.sessions_dir, batch_id)
-        except Exception as exc:
-            logger.exception("[导入] %s 失败", phone)
-            batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason=str(exc))
 
-    batch_store.finish(batch_id)
-    # 清理解压临时目录,保留原始 zip 供用户重传使用
-    shutil.rmtree(extract_root, ignore_errors=True)
-    logger.info("[导入] batch=%s 完成,共 %d 个号", batch_id, len(dirs))
+async def _mark_import_need_relogin(phone: str) -> bool:
+    """导入仍处于初始化且池为空时，才降级为需重新登录。"""
+    async with account_state_lock():
+        if client_manager.get_client(phone) is not None:
+            return False
+        affected = await run_db(
+            account_repo.update_status_if_current,
+            phone,
+            int(AccountStatus.NEED_RELOGIN),
+            _IMPORT_PENDING_STATUSES,
+        )
+        return bool(affected)
 
 
 async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: str) -> None:
@@ -195,24 +268,22 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
         await client.connect()
         if await client.is_user_authorized():
             me = await client.get_me()
-            await client_manager.register_ready_client(phone, client)
+            await client_manager.register_ready_client(phone, client, me)
             registered = True  # client 已交给池接管,后续不可在此 disconnect
-            await run_db(
-                account_repo.mark_logged_in, phone,
-                getattr(me, "id", None), getattr(me, "first_name", None),
-                getattr(me, "last_name", None), getattr(me, "username", None),
-            )
             batch_store.set_item(batch_id, phone, ITEM_SUCCESS, note="已登录")
             logger.info("[导入] %s 登录成功", phone)
         else:
             # session 已失效(authkey 不被服务端承认):协议号无法靠验证码重登,该号已无用
             # → 判死进死号列表(对齐 client_manager._connect_account 启动口径)。
-            await run_db(account_repo.mark_dead, phone,
-                         "SessionInvalid", "导入校验时 session 已失效(未授权)")
+            await mark_dead_by_reason(
+                phone, "SessionInvalid", "导入校验时 session 已失效(未授权)",
+                expected_client=None,
+                expected_statuses=_IMPORT_PENDING_STATUSES,
+            )
             batch_store.set_item(batch_id, phone, ITEM_FAILED,
                                  fail_reason="会话已失效,已判为死号(可在死号列表复活或删除)")
     except errors.FloodWaitError as exc:
-        await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+        await _mark_import_need_relogin(phone)
         batch_store.set_item(batch_id, phone, ITEM_FAILED,
                              fail_reason=f"频率限制,请等待 {exc.seconds} 秒后重试")
     except ValueError as exc:
@@ -220,7 +291,7 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
         # 这是版本不匹配,不是号本身坏:新版工具写的多列 session 喂给旧版 Telethon 读不了。
         # 给运营能看懂的中文,指向真正的解法(升级 telethon),不再泄英文原文。
         logger.warning("[导入] %s session 格式与当前 Telethon 不兼容: %s", phone, exc)
-        await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+        await _mark_import_need_relogin(phone)
         batch_store.set_item(
             batch_id, phone, ITEM_FAILED,
             fail_reason="session 格式与当前 Telethon 版本不兼容,请升级服务端 telethon 或改手机号登录",
@@ -230,13 +301,18 @@ async def _import_one(phone: str, dir_path: Path, sessions_dir: Path, batch_id: 
         if is_dead_error(exc):
             # 终态死号异常(session 作废/封号/多 IP 撞车)→ 判死进死号列表。
             logger.warning("[导入] %s 连接校验死号异常 reason=%s", phone, type(exc).__name__)
-            await run_db(account_repo.mark_dead, phone, type(exc).__name__, str(exc))
+            await mark_dead_and_remove(
+                phone,
+                exc,
+                expected_client=None,
+                expected_statuses=_IMPORT_PENDING_STATUSES,
+            )
             batch_store.set_item(batch_id, phone, ITEM_FAILED,
                                  fail_reason=f"账号已失效({type(exc).__name__}),已判为死号")
         else:
             # 非终态:记完整堆栈便于排查,降级为需重登,不向上抛(避免英文异常覆盖中文 reason)。
             logger.exception("[导入] %s 连接校验异常", phone)
-            await run_db(account_repo.update_status, phone, int(AccountStatus.NEED_RELOGIN))
+            await _mark_import_need_relogin(phone)
             batch_store.set_item(batch_id, phone, ITEM_FAILED, fail_reason="连接校验失败,请改走手机号登录")
     finally:
         # 未进池的 client 一律断开,防 TCP 连接与读循环泄漏

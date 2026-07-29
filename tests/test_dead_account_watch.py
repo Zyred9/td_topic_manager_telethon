@@ -66,6 +66,49 @@ class AccountWatchTest(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         client_manager._clients.clear()
 
+    async def test_ready_frozen_account_is_marked_dead_before_profile_sync(self) -> None:
+        phone = "+10000000034"
+        me = SimpleNamespace(
+            id=1,
+            username="frozen_user",
+            bot_verification_icon=5449449325434266744,
+        )
+        full_user = SimpleNamespace(
+            full_user=SimpleNamespace(
+                bot_verification=SimpleNamespace(
+                    bot_id=777000,
+                    description="The account was frozen",
+                ),
+            ),
+        )
+        client = AsyncMock(return_value=full_user)
+        client.is_connected = lambda: True
+        client.get_me.return_value = me
+        client_manager._clients[phone] = client
+
+        with (
+            patch(
+                "core.client_manager.mark_dead_by_reason",
+                new=AsyncMock(return_value=True),
+            ) as mark_dead,
+            patch.object(
+                account_watch_service,
+                "_sync_profile",
+                new=AsyncMock(),
+            ) as sync_profile,
+        ):
+            await account_watch_service._check_one(phone)
+
+        self.assertEqual("GetFullUserRequest", type(client.await_args.args[0]).__name__)
+        mark_dead.assert_awaited_once_with(
+            phone,
+            "AccountFrozen",
+            "Telegram账号已冻结(The account was frozen)",
+            expected_client=client,
+            expected_statuses=None,
+        )
+        sync_profile.assert_not_awaited()
+
     async def test_watch_tick_includes_logged_in_and_need_relogin_accounts_outside_pool(self) -> None:
         logged_in = SimpleNamespace(phone="+10000000005", status=int(AccountStatus.LOGGED_IN))
         need_relogin = SimpleNamespace(phone="+10000000006", status=int(AccountStatus.NEED_RELOGIN))

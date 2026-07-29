@@ -142,6 +142,12 @@ async def _check_one(phone: str, account=None) -> None:
     # 远端失效会抛 UnauthorizedError 系异常,据此判死。
     try:
         me = await client.get_me()
+        frozen = await client_manager.mark_frozen_if_needed(
+            phone,
+            client,
+            me,
+            expected_client=client,
+        )
     except Exception as exc:
         if is_dead_error(exc):
             await _mark_dead(phone, exc, expected_client=client, expected_statuses=None)
@@ -152,6 +158,8 @@ async def _check_one(phone: str, account=None) -> None:
                 expected_client=client,
                 expected_statuses=None,
             )
+        return
+    if frozen:
         return
     if me is None:
         # 拿不到自身实体:视作未授权,按模糊失败累计(不直接判死,留重登余地)

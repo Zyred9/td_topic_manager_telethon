@@ -59,20 +59,27 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(manager.get_client(account.phone))
         client.disconnect.assert_awaited_once_with()
 
-    async def test_target_account_logs_basic_and_full_user_on_connect(self) -> None:
+    async def test_frozen_bot_verification_marks_dead_before_registration(self) -> None:
         manager = client_manager_module.ClientManager()
         account = SimpleNamespace(
-            phone="+8801736120330",
+            phone="+10000000033",
             status=int(AccountStatus.LOGGED_IN),
         )
         me = SimpleNamespace(
-            id=1,
+            id=7775124303,
             first_name="first",
-            last_name="last",
-            username="linxi9687",
-            stringify=lambda: "User(deleted=True)",
+            last_name=None,
+            username="other",
+            bot_verification_icon=5449449325434266744,
         )
-        full_user = SimpleNamespace(stringify=lambda: "UserFull(...)")
+        full_user = SimpleNamespace(
+            full_user=SimpleNamespace(
+                bot_verification=SimpleNamespace(
+                    bot_id=777000,
+                    description="The account was frozen",
+                ),
+            ),
+        )
         client = AsyncMock(return_value=full_user)
         client.is_user_authorized.return_value = True
         client.get_me.return_value = me
@@ -83,29 +90,43 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
                 "build_client_for_account",
                 return_value=client,
             ),
-            patch.object(client_manager_module, "run_db", new=AsyncMock(return_value=1)),
-            patch.object(manager, "_register_ready_client_locked", new=AsyncMock()),
-            patch.object(client_manager_module.logger, "warning") as warning,
+            patch.object(client_manager_module, "run_db", new=AsyncMock()) as run_db,
+            patch.object(
+                manager,
+                "_register_ready_client_locked",
+                new=AsyncMock(),
+            ) as register,
+            patch.object(
+                client_manager_module,
+                "mark_dead_by_reason",
+                new=AsyncMock(return_value=True),
+            ) as mark_dead,
         ):
             await manager.connect_account(account)
 
-        self.assertEqual("GetFullUserRequest", type(client.await_args.args[0]).__name__)
-        self.assertEqual(4, warning.call_count)
-        self.assertIn("authorized", warning.call_args_list[0].args[0])
-        self.assertIn("核心字段", warning.call_args_list[1].args[0])
-        self.assertIn("full_user_type", warning.call_args_list[3].args[0])
+        mark_dead.assert_awaited_once_with(
+            account.phone,
+            "AccountFrozen",
+            "Telegram账号已冻结(The account was frozen)",
+            expected_client=None,
+            expected_statuses=(int(AccountStatus.LOGGED_IN),),
+        )
+        run_db.assert_not_awaited()
+        register.assert_not_awaited()
+        client.disconnect.assert_awaited_once_with()
 
-    async def test_target_full_user_failure_does_not_block_registration(self) -> None:
+    async def test_full_user_failure_does_not_block_registration(self) -> None:
         manager = client_manager_module.ClientManager()
         account = SimpleNamespace(
-            phone="+8801736120330",
+            phone="+10000000035",
             status=int(AccountStatus.LOGGED_IN),
         )
         me = SimpleNamespace(
             id=1,
             first_name="first",
             last_name="last",
-            username="linxi9687",
+            username="active_user",
+            bot_verification_icon=5449449325434266744,
         )
         client = AsyncMock(side_effect=RuntimeError("diagnostic failure"))
         client.is_user_authorized.return_value = True
@@ -141,21 +162,21 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
 
         run_db.assert_awaited_once_with(account_repo.reset_all_status_on_startup)
 
-    async def test_startup_target_filter_connects_only_matching_account(self) -> None:
+    async def test_startup_connects_all_candidate_accounts(self) -> None:
         manager = client_manager_module.ClientManager()
-        target = SimpleNamespace(
-            phone="+8801736120330",
-            tg_username="linxi9687",
-            status=int(AccountStatus.LOGGED_IN),
-        )
-        other = SimpleNamespace(
+        first = SimpleNamespace(
             phone="+10000000031",
-            tg_username="other",
+            tg_username="first",
             status=int(AccountStatus.LOGGED_IN),
         )
-        stale_username = SimpleNamespace(
+        second = SimpleNamespace(
             phone="+10000000032",
-            tg_username="linxi9687",
+            tg_username="second",
+            status=int(AccountStatus.LOGGED_IN),
+        )
+        third = SimpleNamespace(
+            phone="+10000000033",
+            tg_username="third",
             status=int(AccountStatus.LOGGED_IN),
         )
 
@@ -163,16 +184,16 @@ class ReconnectTest(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 client_manager_module,
                 "run_db",
-                new=AsyncMock(return_value=[other, stale_username, target]),
+                new=AsyncMock(return_value=[first, second, third]),
             ),
             patch.object(manager, "connect_account", new=AsyncMock()) as connect_account,
         ):
-            await manager.startup(
-                only_phone="8801736120330",
-                only_username="linxi9687",
-            )
+            await manager.startup()
 
-        connect_account.assert_awaited_once_with(target)
+        self.assertEqual(
+            [call(first), call(second), call(third)],
+            connect_account.await_args_list,
+        )
 
     async def test_startup_failure_uses_conditional_reconnect_transition(self) -> None:
         manager = client_manager_module.ClientManager()

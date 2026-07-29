@@ -74,10 +74,7 @@ async def lifespan(app: FastAPI):
     async def _background_startup() -> None:
         try:
             logger.info("后台全起已登录小号(不阻塞 web)...")
-            await client_manager.startup(
-                only_phone="8801736120330",
-                only_username="linxi9687",
-            )
+            await client_manager.startup()
             # 全起完再启动话题自驱(否则池里还没号,自驱空跑)
             topic_scheduler.start_scheduler()
             logger.info("后台全起完成,话题自驱已启动")
@@ -88,7 +85,8 @@ async def lifespan(app: FastAPI):
 
     startup_task = asyncio.create_task(_background_startup())
 
-    # ponytail: 定点初始化观察期间不启动全量巡检，避免巡检补连其他账号。
+    # 巡检不依赖全起完成(它自己遍历池内号),可立即启动
+    account_watch_service.start_watch()
 
     logger.info("=" * 50)
     logger.info("服务启动完成(小号后台加载中),根路径 %s,端口 %s",

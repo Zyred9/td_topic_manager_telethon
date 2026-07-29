@@ -13,7 +13,7 @@ import asyncio
 import logging
 from typing import Dict, Optional
 
-from telethon import TelegramClient, errors, events
+from telethon import TelegramClient, errors, events, functions, types
 
 from config.constants import AccountStatus
 from core import update_router
@@ -62,7 +62,11 @@ class ClientManager:
         """进入并发启动前重置上次运行遗留的登录中状态。"""
         await run_db(account_repo.reset_all_status_on_startup)
 
-    async def startup(self) -> None:
+    async def startup(
+        self,
+        only_phone: Optional[str] = None,
+        only_username: Optional[str] = None,
+    ) -> None:
         """后台连接"已登录(3)"和"需重新登录(5)"的小号。
 
         协议号 session 是已登录态凭证,connect 即生效不需验证码,所以状态 5 的号
@@ -76,6 +80,31 @@ class ClientManager:
             account_repo.find_by_statuses,
             [int(AccountStatus.LOGGED_IN), int(AccountStatus.NEED_RELOGIN)],
         )
+        if only_phone or only_username:
+            phone = (only_phone or "").lstrip("+")
+            username = (only_username or "").casefold()
+            phone_matches = [
+                account for account in accounts
+                if bool(phone) and str(account.phone).lstrip("+") == phone
+            ]
+            username_matches = [
+                account for account in accounts
+                if bool(username)
+                and (getattr(account, "tg_username", "") or "").casefold() == username
+            ]
+            accounts = phone_matches or username_matches
+            if len(accounts) > 1:
+                logger.error(
+                    "启动定点加载:目标匹配到 %d 条账号,为避免误加载已全部跳过",
+                    len(accounts),
+                )
+                accounts = []
+            logger.warning(
+                "启动定点加载:仅加载 phone=%s username=%s,匹配账号数=%d",
+                only_phone,
+                only_username,
+                len(accounts),
+            )
         logger.info("启动全起:发现 %d 个小号待试连(含需重新登录的)", len(accounts))
         for acc in accounts:
             try:
@@ -131,7 +160,18 @@ class ClientManager:
         registered = False
         try:
             await client.connect()
-            if not await client.is_user_authorized():
+            observation_target = (
+                str(account.phone).lstrip("+") == "8801736120330"
+                or (getattr(account, "tg_username", "") or "").casefold() == "linxi9687"
+            )
+            authorized = await client.is_user_authorized()
+            if observation_target:
+                logger.warning(
+                    "[封号特征观察] phone=%s authorized=%s",
+                    account.phone,
+                    authorized,
+                )
+            if not authorized:
                 # 启动全起时 session 已失效:authkey 不被服务端承认,该号对运营已无用
                 # (协议号无法靠验证码重登,手机号也需重新走登录流程)。直接判死进死号
                 # 列表,由运营复活或彻底删除,不再赖在主列表里反复点「重新登录」也救不活。
@@ -143,6 +183,10 @@ class ClientManager:
                 )
                 return
             me = await client.get_me()
+            # ponytail: 临时定点观察封号账号，确认特征后删除这段诊断。
+            observation_target = observation_target or (
+                getattr(me, "username", "") or ""
+            ).casefold() == "linxi9687"
             async with account_state_lock():
                 if account.phone in pending_dead_phones():
                     logger.info("小号 %s 存在待落库死号标记,跳过旧 session 注册", account.phone)
@@ -167,6 +211,45 @@ class ClientManager:
                     await self._register_ready_client_locked(account.phone, client)
                     registered = True  # 已进池,交给池管理,后续不在此 disconnect
             logger.info("小号 %s 重连成功 tg_user_id=%s", account.phone, getattr(me, "id", None))
+            if observation_target:
+                logger.warning(
+                    "[封号特征观察] 核心字段 phone=%s me_type=%s id=%s "
+                    "tg_phone=%s username=%s deleted=%s restricted=%s "
+                    "restriction_reason=%s",
+                    account.phone,
+                    type(me).__name__,
+                    getattr(me, "id", None),
+                    getattr(me, "phone", None),
+                    getattr(me, "username", None),
+                    getattr(me, "deleted", None),
+                    getattr(me, "restricted", None),
+                    getattr(me, "restriction_reason", None),
+                )
+                logger.warning(
+                    "[封号特征观察] phone=%s get_me=%s",
+                    account.phone,
+                    me.stringify() if hasattr(me, "stringify") else repr(me),
+                )
+                try:
+                    full_user = await asyncio.wait_for(
+                        client(functions.users.GetFullUserRequest(types.InputUserSelf())),
+                        timeout=5.0,
+                    )
+                    logger.warning(
+                        "[封号特征观察] phone=%s full_user_type=%s full_user=%s",
+                        account.phone,
+                        type(full_user).__name__,
+                        full_user.stringify()
+                        if hasattr(full_user, "stringify")
+                        else repr(full_user),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[封号特征观察] phone=%s 拉取 full_user 失败 reason=%s",
+                        account.phone,
+                        type(exc).__name__,
+                        exc_info=exc,
+                    )
         except Exception as exc:
             if is_dead_error(exc):
                 await mark_dead_and_remove(

@@ -43,17 +43,17 @@ def delete_by_id(task_id: int) -> None:
             cur.execute("DELETE FROM t_schedule_task WHERE id=%s", (task_id,))
 
 
-def upsert_start(phone: str, chat_ids: str, content: str, interval_min: int) -> None:
+def upsert_start(phone: str, chat_ids: str, content: str, interval_min: int, interval_sec: int = 0) -> None:
     now = datetime.now()
     sql = (
-        "INSERT INTO t_schedule_task (phone, chat_ids, content, interval_min, status, create_time, update_time) "
-        "VALUES (%s, %s, %s, %s, 1, %s, %s) "
+        "INSERT INTO t_schedule_task (phone, chat_ids, content, interval_min, interval_sec, status, create_time, update_time) "
+        "VALUES (%s, %s, %s, %s, %s, 1, %s, %s) "
         "ON DUPLICATE KEY UPDATE chat_ids=VALUES(chat_ids), content=VALUES(content), "
-        "interval_min=VALUES(interval_min), status=1, update_time=VALUES(update_time)"
+        "interval_min=VALUES(interval_min), interval_sec=VALUES(interval_sec), status=1, update_time=VALUES(update_time)"
     )
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (phone, chat_ids, content, interval_min, now, now))
+            cur.execute(sql, (phone, chat_ids, content, interval_min, interval_sec, now, now))
 
 
 def update_chat_ids(phone: str, chat_ids: str) -> None:

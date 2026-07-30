@@ -36,6 +36,7 @@ def _to_vo(row: dict) -> dict:
         "chatIds": row["chat_ids"],
         "content": row["content"],
         "intervalMin": row["interval_min"],
+        "intervalSec": row.get("interval_sec", 0),
         "status": row["status"],
         "lastSent": row["last_sent"].strftime("%Y-%m-%d %H:%M:%S") if row.get("last_sent") else None,
     }
@@ -56,20 +57,22 @@ async def list_all() -> List[dict]:
     return [_to_vo(row) for row in rows]
 
 
-async def start(phone: str, chat_ids: List[int], content: str, interval_min: int) -> None:
+async def start(phone: str, chat_ids: List[int], content: str, interval_min: int, interval_sec: int = 0) -> None:
     phone = _normalize(phone)
-    if interval_min <= 0:
-        raise ValueError("发送间隔必须大于 0 分钟")
+    if interval_min < 0 or interval_sec < 0:
+        raise ValueError("发送间隔不能为负数")
+    if interval_min == 0 and interval_sec <= 0:
+        raise ValueError("发送间隔必须大于 0 秒")
     if not chat_ids:
         raise ValueError("至少选择一个群")
 
     chat_ids_str = ",".join(str(c) for c in chat_ids)
-    await run_db(schedule_repo.upsert_start, phone, chat_ids_str, content, interval_min)
+    await run_db(schedule_repo.upsert_start, phone, chat_ids_str, content, interval_min, interval_sec)
 
     # 替换旧任务
     await _cancel_task(phone)
-    _tasks[phone] = asyncio.create_task(_run_loop(phone, chat_ids, content, interval_min))
-    logger.info("定时发送启动 phone=%s 群数=%d 间隔=%d分钟", phone, len(chat_ids), interval_min)
+    _tasks[phone] = asyncio.create_task(_run_loop(phone, chat_ids, content, interval_min, interval_sec))
+    logger.info("定时发送启动 phone=%s 群数=%d 间隔=%d分%d秒", phone, len(chat_ids), interval_min, interval_sec)
 
 
 async def stop(phone: str, persist: bool = True) -> None:
@@ -90,15 +93,15 @@ async def _cancel_task(phone: str) -> None:
             pass
 
 
-async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min: int) -> None:
+async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min: int, interval_sec: int = 0) -> None:
     from core.client_manager import client_manager
 
-    interval_sec = interval_min * 60
+    interval_total_sec = interval_min * 60 + interval_sec
     # 本地可变副本:某群发失败就从这里剔除(发不出是群级问题,不连累整号/其他群)。
     targets = list(chat_ids)
     try:
         while True:
-            await asyncio.sleep(interval_sec)  # 启动后先等一个间隔再发,第 0 秒不发送
+            await asyncio.sleep(interval_total_sec)  # 启动后先等一个间隔再发,第 0 秒不发送
             sent_any = False
             for chat_id in list(targets):  # 遍历副本,循环内可安全删 targets
                 ok, reason = await message_sender.send_text(
@@ -144,7 +147,7 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
 
 
 # ---------- 批量(统一一份配置下发) ----------
-async def batch_start(phones: List[str], chat_ids: List[int], content: str, interval_min: int) -> dict:
+async def batch_start(phones: List[str], chat_ids: List[int], content: str, interval_min: int, interval_sec: int = 0) -> dict:
     """对所有勾选小号下发同一份定时配置并启动。逐号隔离,返回成功/失败列表。
 
     未就绪(未登录/离线)的号跳过并记入 failed,不阻断其它号。
@@ -159,7 +162,7 @@ async def batch_start(phones: List[str], chat_ids: List[int], content: str, inte
             failed.append({"phone": phone, "reason": "小号未就绪(未登录/离线)"})
             continue
         try:
-            await start(phone, chat_ids, content, interval_min)
+            await start(phone, chat_ids, content, interval_min, interval_sec)
             ok.append(phone)
         except ValueError as exc:
             failed.append({"phone": phone, "reason": str(exc)})
@@ -203,7 +206,7 @@ async def restart(task_id: int) -> None:
     if row is None:
         raise ValueError("任务不存在")
     chat_ids = [int(c) for c in str(row["chat_ids"]).split(",") if c.strip()]
-    await start(row["phone"], chat_ids, row["content"], row["interval_min"])
+    await start(row["phone"], chat_ids, row["content"], row["interval_min"], row.get("interval_sec", 0))
     logger.info("定时任务重启 id=%s phone=%s", task_id, row["phone"])
 
 

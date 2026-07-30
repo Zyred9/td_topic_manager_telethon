@@ -76,6 +76,7 @@ class ScheduleStartReq(BaseModel):
     chatIds: List[int]
     content: str
     intervalMin: int
+    intervalSec: int = 0
 
 
 class ScheduleBatchStartReq(BaseModel):
@@ -84,6 +85,7 @@ class ScheduleBatchStartReq(BaseModel):
     chatIds: List[int]
     content: str
     intervalMin: int
+    intervalSec: int = 0
 
 
 class ScheduleBatchStopReq(BaseModel):

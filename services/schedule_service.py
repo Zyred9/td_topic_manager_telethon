@@ -118,17 +118,9 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
                             await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
                             logger.warning("[定时] phone=%s 已不可用(判死/掉线),定时任务停止:%s", phone, reason)
                             return
-                        # 号还在,只是这个群发不出:剔除该群并落库,号继续发其余群。
-                        targets.remove(chat_id)
-                        await run_db(schedule_repo.update_chat_ids,
-                                     phone, ",".join(str(c) for c in targets))
-                        logger.warning("[定时] phone=%s 群 %s 发送失败,已移出该群:%s",
+                        # 号还在,只是本轮发送失败(Flood/慢速/网络等):记日志跳过,下轮继续,不改群列表
+                        logger.warning("[定时] phone=%s 群 %s 本轮发送失败,下轮重试:%s",
                                        phone, chat_id, reason)
-                        if not targets:
-                            # 一个群都不剩:停整个任务,避免空转
-                            await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
-                            logger.warning("[定时] phone=%s 所有群均发送失败,定时任务已停止", phone)
-                            return
                     else:
                         sent_any = True
                     await asyncio.sleep(random.uniform(2, 3))  # 群间抖动

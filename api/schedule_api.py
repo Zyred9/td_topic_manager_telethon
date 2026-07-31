@@ -53,7 +53,7 @@ async def list_schedule_tasks(_: CurrentUser = Depends(get_current_user)) -> dic
 async def batch_delete_schedule(
     req: ScheduleBatchIdsReq, _: CurrentUser = Depends(get_current_user),
 ) -> dict:
-    """按 id 批量删除定时任务(先停协程再删 DB)。"""
+    """按 id 批量删除定时任务(DB 删除成功后再停协程)。"""
     if not req.ids:
         raise BizError("请先勾选任务")
     return result(await schedule_service.batch_delete(req.ids))

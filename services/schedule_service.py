@@ -15,12 +15,14 @@ from typing import Dict, List, Optional
 from config.constants import SendSource, TaskStatus
 from core import message_sender
 from infra.db import run_db
-from repositories import schedule_repo
+from repositories import account_repo, schedule_repo
 
 logger = logging.getLogger(__name__)
 
 # phone -> 运行中的周期任务
 _tasks: Dict[str, asyncio.Task] = {}
+# ponytail: 定时任务状态变更是低频操作，一个进程内锁即可保证 DB 与内存任务顺序一致。
+_task_state_lock = asyncio.Lock()
 
 
 def _normalize(phone: str) -> str:
@@ -59,12 +61,23 @@ async def list_all() -> List[dict]:
 
 async def start(phone: str, chat_ids: List[int], content: str, interval_min: int, interval_sec: int = 0) -> None:
     phone = _normalize(phone)
+    async with _task_state_lock:
+        await _start_locked(phone, chat_ids, content, interval_min, interval_sec)
+
+
+async def _start_locked(phone: str, chat_ids: List[int], content: str, interval_min: int, interval_sec: int) -> None:
+    from core.client_manager import client_manager
+
     if interval_min < 0 or interval_sec < 0:
         raise ValueError("发送间隔不能为负数")
     if interval_min == 0 and interval_sec <= 0:
         raise ValueError("发送间隔必须大于 0 秒")
     if not chat_ids:
         raise ValueError("至少选择一个群")
+    if not content or not content.strip():
+        raise ValueError("发送内容不能为空")
+    if client_manager.get_ready_client(phone) is None:
+        raise ValueError("小号未就绪(未登录/离线)")
 
     chat_ids_str = ",".join(str(c) for c in chat_ids)
     await run_db(schedule_repo.upsert_start, phone, chat_ids_str, content, interval_min, interval_sec)
@@ -77,9 +90,10 @@ async def start(phone: str, chat_ids: List[int], content: str, interval_min: int
 
 async def stop(phone: str, persist: bool = True) -> None:
     phone = _normalize(phone)
-    await _cancel_task(phone)
-    if persist:
-        await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
+    async with _task_state_lock:
+        if persist:
+            await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
+        await _cancel_task(phone)
     logger.info("定时发送停止 phone=%s", phone)
 
 
@@ -97,14 +111,12 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
     from core.client_manager import client_manager
 
     interval_total_sec = interval_min * 60 + interval_sec
-    # 本地可变副本:某群发失败就从这里剔除(发不出是群级问题,不连累整号/其他群)。
-    targets = list(chat_ids)
     try:
         while True:
             try:
                 await asyncio.sleep(interval_total_sec)  # 启动后先等一个间隔再发,第 0 秒不发送
                 sent_any = False
-                for chat_id in list(targets):  # 遍历副本,循环内可安全删 targets
+                for chat_id in chat_ids:
                     ok, reason = await message_sender.send_text(
                         phone, chat_id, content, source=SendSource.SCHEDULE,
                     )
@@ -112,12 +124,21 @@ async def _run_loop(phone: str, chat_ids: List[int], content: str, interval_min:
                         # 配额满只代表本轮跳过,不能把正常群永久移出定时任务。
                         if reason == message_sender.REASON_QUOTA_FULL:
                             break
-                        # 号被判死(UserBanned/终态失效)会被 message_sender 出池:此时整号已不可用,
-                        # 直接停整个定时任务,别再逐群剔除刷屏。
+                        # client 暂时不在线不等于死号；仅 DB 已判死或账号已删除时永久停止。
                         if client_manager.get_ready_client(phone) is None:
-                            await run_db(schedule_repo.update_status, phone, int(TaskStatus.STOPPED))
-                            logger.warning("[定时] phone=%s 已不可用(判死/掉线),定时任务停止:%s", phone, reason)
-                            return
+                            account = await run_db(account_repo.find_by_phone, phone)
+                            if account is None or int(account.is_dead) == 1:
+                                async with _task_state_lock:
+                                    if _tasks.get(phone) is asyncio.current_task():
+                                        await run_db(
+                                            schedule_repo.update_status,
+                                            phone,
+                                            int(TaskStatus.STOPPED),
+                                        )
+                                logger.warning("[定时] phone=%s 已判死或删除,定时任务停止:%s", phone, reason)
+                                return
+                            logger.warning("[定时] phone=%s 临时未就绪,下轮重试:%s", phone, reason)
+                            break
                         # 号还在,只是本轮发送失败(Flood/慢速/网络等):记日志跳过,下轮继续,不改群列表
                         logger.warning("[定时] phone=%s 群 %s 本轮发送失败,下轮重试:%s",
                                        phone, chat_id, reason)
@@ -143,15 +164,10 @@ async def batch_start(phones: List[str], chat_ids: List[int], content: str, inte
 
     未就绪(未登录/离线)的号跳过并记入 failed,不阻断其它号。
     """
-    from core.client_manager import client_manager
-
     ok: List[str] = []
     failed: List[dict] = []
     for raw in phones:
         phone = _normalize(raw)
-        if client_manager.get_ready_client(phone) is None:
-            failed.append({"phone": phone, "reason": "小号未就绪(未登录/离线)"})
-            continue
         try:
             await start(phone, chat_ids, content, interval_min, interval_sec)
             ok.append(phone)
@@ -182,22 +198,25 @@ async def batch_stop(phones: List[str]) -> dict:
 
 # ---------- 按 id 管理(定时任务管理页) ----------
 async def delete(task_id: int) -> None:
-    """删除单条定时任务:先停运行中的发送协程,再删 DB 行。"""
-    row = await run_db(schedule_repo.find_by_id, task_id)
-    if row is None:
-        raise ValueError("任务不存在")
-    await _cancel_task(_normalize(row["phone"]))
-    await run_db(schedule_repo.delete_by_id, task_id)
+    """删除单条定时任务:DB 删除成功后再停运行中的发送协程。"""
+    async with _task_state_lock:
+        row = await run_db(schedule_repo.find_by_id, task_id)
+        if row is None:
+            raise ValueError("任务不存在")
+        await run_db(schedule_repo.delete_by_id, task_id)
+        await _cancel_task(_normalize(row["phone"]))
     logger.info("定时任务删除 id=%s phone=%s", task_id, row["phone"])
 
 
 async def restart(task_id: int) -> None:
     """用表里存的原配置重启单条定时任务。"""
-    row = await run_db(schedule_repo.find_by_id, task_id)
-    if row is None:
-        raise ValueError("任务不存在")
-    chat_ids = [int(c) for c in str(row["chat_ids"]).split(",") if c.strip()]
-    await start(row["phone"], chat_ids, row["content"], row["interval_min"], row.get("interval_sec", 0))
+    async with _task_state_lock:
+        row = await run_db(schedule_repo.find_by_id, task_id)
+        if row is None:
+            raise ValueError("任务不存在")
+        phone = _normalize(row["phone"])
+        chat_ids = [int(c) for c in str(row["chat_ids"]).split(",") if c.strip()]
+        await _start_locked(phone, chat_ids, row["content"], row["interval_min"], row.get("interval_sec", 0))
     logger.info("定时任务重启 id=%s phone=%s", task_id, row["phone"])
 
 
@@ -220,8 +239,6 @@ async def batch_delete(ids: List[int]) -> dict:
 
 async def batch_restart(ids: List[int]) -> dict:
     """批量重启定时任务(用各自表里的原配置)。逐 id 隔离,返回成功/失败列表。"""
-    from core.client_manager import client_manager
-
     ok: List[str] = []
     failed: List[dict] = []
     for task_id in ids:
@@ -230,9 +247,6 @@ async def batch_restart(ids: List[int]) -> dict:
             failed.append({"phone": str(task_id), "reason": "任务不存在"})
             continue
         phone = _normalize(row["phone"])
-        if client_manager.get_ready_client(phone) is None:
-            failed.append({"phone": phone, "reason": "小号未就绪(未登录/离线)"})
-            continue
         try:
             await restart(task_id)
             ok.append(phone)

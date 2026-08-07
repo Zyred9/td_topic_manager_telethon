@@ -1,10 +1,11 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, call, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 from config.constants import TaskStatus
 from core.client_manager import client_manager
+from infra import db
 from services import schedule_service
 
 
@@ -155,6 +156,30 @@ class ScheduleLoopTest(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(max_active, 1)
+
+
+class ScheduleMigrationTest(unittest.TestCase):
+    def test_old_schedule_table_gets_interval_sec_column(self) -> None:
+        cursor = MagicMock()
+        connection = MagicMock()
+        connection.cursor.return_value.__enter__.return_value = cursor
+        connection_context = MagicMock()
+        connection_context.__enter__.return_value = connection
+
+        def column_exists(_cursor, table: str, column: str) -> bool:
+            return (table, column) != ("t_schedule_task", "interval_sec")
+
+        with (
+            patch.object(db, "get_connection", return_value=connection_context),
+            patch.object(db, "_column_exists", side_effect=column_exists),
+            patch.object(db, "_index_exists", return_value=True),
+        ):
+            db._run_migrations()
+
+        cursor.execute.assert_called_once_with(
+            "ALTER TABLE t_schedule_task ADD COLUMN interval_sec INT NOT NULL DEFAULT 0 "
+            "COMMENT '发送间隔(秒),与 interval_min 叠加' AFTER interval_min"
+        )
 
 
 if __name__ == "__main__":

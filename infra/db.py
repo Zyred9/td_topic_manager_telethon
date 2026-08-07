@@ -267,6 +267,9 @@ def _index_exists(cursor, table: str, index: str) -> bool:
 def _run_migrations() -> None:
     """对已存在的老库做幂等补列(新库 schema.sql 已含,跳过)。"""
     migrations = [
+        ("t_schedule_task", "interval_sec",
+         "ALTER TABLE t_schedule_task ADD COLUMN interval_sec INT NOT NULL DEFAULT 0 "
+         "COMMENT '发送间隔(秒),与 interval_min 叠加' AFTER interval_min"),
         ("t_account_watch", "chat_title",
          "ALTER TABLE t_account_watch ADD COLUMN chat_title VARCHAR(255) "
          "COMMENT '群名(加群时回填,展示用)' AFTER chat_id"),

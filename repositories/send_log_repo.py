@@ -40,24 +40,6 @@ def insert(
             ))
 
 
-def phones_with_banned_count_at_least(min_fails: int) -> List[str]:
-    """找出累计「被群封」(UserBannedInChannelError)≥ min_fails 条的号,供启动扫描判死。
-
-    口径与实时判死一致:只有 UserBannedInChannelError 才进死号列表。被禁言/限流/超时等
-    其余失败不算(它们可能是临时或群级问题,实时也不判死),避免误杀整批好号。
-    """
-    sql = (
-        "SELECT phone FROM t_send_log "
-        "WHERE ok = 0 AND err_code = 'UserBannedInChannelError' "
-        "GROUP BY phone HAVING COUNT(*) >= %s"
-    )
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute(sql, (int(min_fails),))
-            rows = cur.fetchall()
-    return [r["phone"] for r in rows]
-
-
 def page_by_phone(
     phone: str, page_no: int, size: int,
     only_failed: bool = False, hours: Optional[int] = None,

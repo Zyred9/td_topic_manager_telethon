@@ -115,8 +115,6 @@ class WatchConfig:
     """小号健康巡检参数:周期检测在线/授权状态并同步实时资料。"""
 
     interval_min: int
-    # 启动扫描:t_send_log 里累计真发送失败 ≥ startup_fail_count 条的号,启动时一次性判死。
-    startup_fail_count: int
 
 
 @dataclass(frozen=True)
@@ -215,7 +213,6 @@ def get_settings() -> Settings:
         ),
         watch=WatchConfig(
             interval_min=_get_int("ACCOUNT_WATCH_INTERVAL_MIN", 15),
-            startup_fail_count=_get_int("ACCOUNT_STARTUP_FAIL_COUNT", 3),
         ),
         proxy=ProxyConfig(
             host=os.getenv("TD_PROXY_HOST") or None,

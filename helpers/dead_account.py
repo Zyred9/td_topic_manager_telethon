@@ -52,20 +52,6 @@ def is_dead_error(exc: BaseException) -> bool:
     return isinstance(exc, _EXTRA_DEAD_ERRORS)
 
 
-def is_send_dead_error(exc: BaseException) -> bool:
-    """发送链路失败时,该异常是否要判死整号(出池、进死号列表)。
-
-    口径(运营锁定):
-    - 终态 session 失效(is_dead_error:封号/作废)→ 判死。
-    - UserBannedInChannelError(被该群永久封禁)→ 判死。运营要求这类进死号列表。
-    其余一切失败(被禁言 ChatWriteForbidden / 限流 / 超时 / 群私有等)返回 False,
-    不判死号 —— 由调用方(定时任务)按「只停该群」处理,不连累整号。
-    """
-    if is_dead_error(exc):
-        return True
-    return isinstance(exc, errors.UserBannedInChannelError)
-
-
 def account_state_lock() -> asyncio.Lock:
     """返回判死/授权注册共享的账号状态转换锁。"""
     return _account_state_lock

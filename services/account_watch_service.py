@@ -24,12 +24,11 @@ from helpers.dead_account import (
     account_state_lock,
     is_dead_error,
     mark_dead_and_remove,
-    mark_dead_by_reason,
     pending_dead_phones,
     retry_pending_dead_marks,
 )
 from infra.db import run_db
-from repositories import account_repo, send_log_repo
+from repositories import account_repo
 
 logger = logging.getLogger(__name__)
 
@@ -37,18 +36,24 @@ logger = logging.getLogger(__name__)
 _JITTER_MIN_SEC = 1.0
 _JITTER_MAX_SEC = 2.0
 
+# 临时网络抖动不能直接让账号掉线；同一个 client 连续失败两轮才置需重登。
+_AMBIGUOUS_FAIL_CONFIRM_ROUNDS = 2
+_probe_fail_streak: dict[str, tuple[object | None, int]] = {}
+
 _watch_task: Optional[asyncio.Task] = None
 
 
 async def _mark_dead(phone: str, exc: BaseException, expected_client, expected_statuses) -> None:
     """命中终态死号异常:走公共口径标死并出池。"""
     logger.warning("巡检判定死号 phone=%s reason=%s", phone, type(exc).__name__, exc_info=exc)
-    await mark_dead_and_remove(
+    marked = await mark_dead_and_remove(
         phone,
         exc,
         expected_client=expected_client,
         expected_statuses=expected_statuses,
     )
+    if marked:
+        _probe_fail_streak.pop(phone, None)
 
 
 async def _on_ambiguous_fail(
@@ -63,7 +68,26 @@ async def _on_ambiguous_fail(
         if current_client is not expected_client:
             logger.info("巡检旧 client 失败结果已过期,跳过状态变更 phone=%s", phone)
             return
-        logger.warning("巡检探活失败,置需重登并出池 phone=%s", phone, exc_info=exc)
+        streak_client, previous_streak = _probe_fail_streak.get(phone, (expected_client, 0))
+        streak = previous_streak + 1 if streak_client is expected_client else 1
+        if streak < _AMBIGUOUS_FAIL_CONFIRM_ROUNDS:
+            _probe_fail_streak[phone] = (expected_client, streak)
+            logger.warning(
+                "巡检探活失败(第 %d/%d 轮),暂不下线 phone=%s",
+                streak,
+                _AMBIGUOUS_FAIL_CONFIRM_ROUNDS,
+                phone,
+                exc_info=exc,
+            )
+            return
+
+        _probe_fail_streak.pop(phone, None)
+        logger.warning(
+            "巡检探活连续 %d 轮失败,置需重登并出池 phone=%s",
+            streak,
+            phone,
+            exc_info=exc,
+        )
         should_remove = True
         try:
             if expected_statuses is None:
@@ -112,6 +136,8 @@ async def _check_one(phone: str, account=None) -> None:
                         expected_client=None,
                         expected_statuses=(int(account.status),),
                     )
+            else:
+                _probe_fail_streak.pop(phone, None)
             return
         try:
             await raw.connect()
@@ -160,6 +186,7 @@ async def _check_one(phone: str, account=None) -> None:
             )
         return
     if frozen:
+        _probe_fail_streak.pop(phone, None)
         return
     if me is None:
         # 拿不到自身实体:视作未授权,按模糊失败累计(不直接判死,留重登余地)
@@ -172,6 +199,7 @@ async def _check_one(phone: str, account=None) -> None:
         return
 
     # 探活成功:同步实时资料(问题5)
+    _probe_fail_streak.pop(phone, None)
     await _sync_profile(phone, me)
 
 
@@ -198,25 +226,6 @@ async def _sync_profile(phone: str, me) -> None:
         logger.info(
             "巡检同步资料 phone=%s 昵称 %r->%r 用户名 %r->%r",
             phone, acc.tg_first_name, new_first, acc.tg_username, new_username,
-        )
-
-
-async def scan_dead_on_startup() -> None:
-    """启动扫描:把 t_send_log 里累计「被群封」≥ 阈值的号一次性判死搬进死号列表。
-
-    补「死号列表为空」的根因:实时判死只在发送那一刻生效,历史日志里已有的 UserBanned
-    失败无人回看 → 死号永远标不上。启动时按发送日志统计一次补判死。口径与实时一致:
-    只数 UserBannedInChannelError,不误杀被禁言/限流的号。mark_dead_by_reason 幂等。
-    """
-    threshold = get_settings().watch.startup_fail_count
-    phones = await run_db(send_log_repo.phones_with_banned_count_at_least, threshold)
-    if not phones:
-        logger.info("启动扫描:无累计被群封 ≥ %d 次的号", threshold)
-        return
-    logger.info("启动扫描:%d 个号累计被群封 ≥ %d 次,判死", len(phones), threshold)
-    for phone in phones:
-        await mark_dead_by_reason(
-            phone, "UserBannedInChannelError", f"启动扫描:累计被群封 ≥ {threshold} 次",
         )
 
 

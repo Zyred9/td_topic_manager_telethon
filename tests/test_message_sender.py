@@ -3,6 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from telethon import errors
+
 from config.constants import SendSource
 from core import message_sender
 from core.throttle import throttle
@@ -10,11 +12,14 @@ from services import group_op_service
 
 
 class _Client:
-    def __init__(self) -> None:
+    def __init__(self, error: BaseException | None = None) -> None:
         self.calls = 0
+        self.error = error
 
     async def send_message(self, chat_id, text, reply_to=None) -> None:
         self.calls += 1
+        if self.error is not None:
+            raise self.error
         await asyncio.sleep(0.01)
 
 
@@ -40,6 +45,60 @@ class MessageSenderTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(1, client.calls)
         self.assertEqual([(True, ""), (False, message_sender.REASON_QUOTA_FULL)], results)
+        throttle.clear_phone(phone)
+
+    async def test_user_banned_in_channel_does_not_mark_account_dead(self) -> None:
+        phone = "+10000000009"
+        client = _Client(errors.UserBannedInChannelError(None))
+        throttle.clear_phone(phone)
+        settings = SimpleNamespace(risk=SimpleNamespace(
+            min_interval_ms=0,
+            max_per_min_per_phone=8,
+        ))
+
+        with (
+            patch("core.throttle.get_settings", return_value=settings),
+            patch.object(message_sender.client_manager, "get_ready_client", return_value=client),
+            patch.object(message_sender, "_log_send", new=AsyncMock()),
+            patch.object(
+                message_sender,
+                "mark_dead_and_remove",
+                new=AsyncMock(),
+            ) as mark_dead,
+        ):
+            ok, reason = await message_sender.send_text(phone, 1, "hello")
+
+        self.assertFalse(ok)
+        self.assertEqual(1, client.calls)
+        self.assertNotIn("账号已失效", reason)
+        mark_dead.assert_not_awaited()
+        throttle.clear_phone(phone)
+
+    async def test_terminal_session_error_still_marks_account_dead(self) -> None:
+        phone = "+10000000010"
+        error = errors.AuthKeyUnregisteredError(None)
+        client = _Client(error)
+        throttle.clear_phone(phone)
+        settings = SimpleNamespace(risk=SimpleNamespace(
+            min_interval_ms=0,
+            max_per_min_per_phone=8,
+        ))
+
+        with (
+            patch("core.throttle.get_settings", return_value=settings),
+            patch.object(message_sender.client_manager, "get_ready_client", return_value=client),
+            patch.object(message_sender, "_log_send", new=AsyncMock()),
+            patch.object(
+                message_sender,
+                "mark_dead_and_remove",
+                new=AsyncMock(),
+            ) as mark_dead,
+        ):
+            ok, reason = await message_sender.send_text(phone, 1, "hello")
+
+        self.assertFalse(ok)
+        self.assertIn("账号已失效", reason)
+        mark_dead.assert_awaited_once_with(phone, error, expected_client=client)
         throttle.clear_phone(phone)
 
 

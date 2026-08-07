@@ -66,8 +66,6 @@ async def lifespan(app: FastAPI):
     from services import account_watch_service
 
     await client_manager.prepare_startup()
-    # 历史日志补判死也在并发边界前完成，确保判死后的号不会进入后台全起候选。
-    await account_watch_service.scan_dead_on_startup()
 
     # 逐号全起放后台:串行连接每号最多 15s,几十上百个号可能耗时数分钟；web 不等待。
 

@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 from config.constants import SendSource, TaskStatus
 from core import message_sender
 from infra.db import run_db
-from repositories import account_repo, schedule_repo
+from repositories import account_repo, schedule_repo, send_log_repo
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,30 @@ async def list_all() -> List[dict]:
     """全部定时任务列表(给定时任务管理页)。"""
     rows = await run_db(schedule_repo.list_all)
     return [_to_vo(row) for row in rows]
+
+
+def _to_failure_vo(row: dict) -> dict:
+    """定时失败去重行 → 前端 ScheduleFailureVO。"""
+    name = " ".join(x for x in (row.get("tg_first_name"), row.get("tg_last_name")) if x).strip()
+    t = row.get("send_time")
+    return {
+        "phone": row["phone"],
+        "chatId": row["chat_id"],
+        "tgName": name or None,
+        "tgUsername": row.get("tg_username"),
+        "failReason": row.get("err_code"),
+        "failReasonZh": row.get("err_message"),
+        "lastFailTime": t.strftime("%Y-%m-%d %H:%M:%S") if t else None,
+    }
+
+
+async def list_failures(page_no: int, size: int) -> dict:
+    """定时失败列表:每个 phone+chat_id 只保留最新一次失败,按时间倒序。"""
+    rows, total = await run_db(send_log_repo.page_schedule_failures, page_no, size)
+    return {
+        "page": page_no, "size": size, "total": total,
+        "records": [_to_failure_vo(row) for row in rows],
+    }
 
 
 async def start(phone: str, chat_ids: List[int], content: str, interval_min: int, interval_sec: int = 0) -> None:

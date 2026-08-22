@@ -68,3 +68,37 @@ def page_by_phone(
             )
             rows = cur.fetchall()
     return list(rows), total
+
+
+def page_schedule_failures(page_no: int, size: int) -> Tuple[List[dict], int]:
+    """定时发送失败去重分页:source=SCHEDULE 且 ok=0,按 phone+chat_id 去重保留最新一条,时间倒序。
+
+    id 自增与 send_time 同序,MAX(id) 即最新失败记录。LEFT JOIN t_account 回填 TG 昵称。
+    """
+    if page_no < 1:
+        page_no = 1
+    offset = (page_no - 1) * size
+
+    count_sql = (
+        "SELECT COUNT(*) AS cnt FROM ("
+        "SELECT phone, chat_id FROM t_send_log "
+        "WHERE source='SCHEDULE' AND ok=0 GROUP BY phone, chat_id"
+        ") t"
+    )
+    data_sql = (
+        "SELECT l.*, a.tg_first_name, a.tg_last_name, a.tg_username "
+        "FROM t_send_log l "
+        "JOIN ("
+        "  SELECT phone, chat_id, MAX(id) AS max_id FROM t_send_log "
+        "  WHERE source='SCHEDULE' AND ok=0 GROUP BY phone, chat_id"
+        ") d ON l.id = d.max_id "
+        "LEFT JOIN t_account a ON a.phone = l.phone "
+        "ORDER BY l.send_time DESC, l.id DESC LIMIT %s OFFSET %s"
+    )
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(count_sql)
+            total = int(cur.fetchone()["cnt"])
+            cur.execute(data_sql, (size, offset))
+            rows = cur.fetchall()
+    return list(rows), total

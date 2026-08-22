@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 
 from api.deps import BizError, CurrentUser, get_current_user, result
 from api.schemas import (
@@ -47,6 +47,16 @@ async def batch_stop_schedule(
 async def list_schedule_tasks(_: CurrentUser = Depends(get_current_user)) -> dict:
     """全部定时任务列表。"""
     return result(await schedule_service.list_all())
+
+
+@router.get("/failures")
+async def list_schedule_failures(
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    _: CurrentUser = Depends(get_current_user),
+) -> dict:
+    """定时失败列表(按 phone+chat_id 去重,只保留最新一次失败)。"""
+    return result(await schedule_service.list_failures(page, size))
 
 
 @router.post("/batch/delete")
